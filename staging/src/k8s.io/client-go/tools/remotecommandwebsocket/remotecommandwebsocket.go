@@ -17,9 +17,16 @@ limitations under the License.
 package remotecommandwebsocket
 
 import (
+	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 
-	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/apimachinery/pkg/util/remotecommand"
+	restclient "k8s.io/client-go/rest"
+	remotecommandspdy "k8s.io/client-go/tools/remotecommand"
+	"k8s.io/client-go/transport/spdy"
+	"k8s.io/client-go/transport/websocket"
 )
 
 // StreamOptions holds information pertaining to the current streaming session:
@@ -30,7 +37,7 @@ type StreamOptions struct {
 	Stdout            io.Writer
 	Stderr            io.Writer
 	Tty               bool
-	TerminalSizeQueue remotecommand.TerminalSizeQueue
+	TerminalSizeQueue remotecommandspdy.TerminalSizeQueue
 }
 
 // Executor is an interface for transporting shell-style streams.
@@ -40,4 +47,61 @@ type Executor interface {
 	// is set, the stderr stream is not used (raw TTY manages stdout and stderr over the
 	// stdout stream).
 	Stream(options StreamOptions) error
+}
+
+// streamExecutor handles transporting standard shell streams over an httpstream connection.
+type streamExecutor struct {
+	upgrader  websocket.Upgrader
+	transport http.RoundTripper
+
+	url       *url.URL
+	protocols []string
+}
+
+// NewWebSocketExecutor creates a new websocket connection to the URL specified with
+// the rest client's TLS configuration and headers
+func NewWebSocketExecutor(config *restclient.Config, url *url.URL) (Executor, error) {
+	wrapper, upgradeRoundTripper, err := websocket.RoundTripperFor(config)
+	if err != nil {
+		return nil, err
+	}
+
+	return NewWebSocketExecutorForTransports(wrapper, upgradeRoundTripper, url)
+}
+
+// NewWebSocketExecutorForTransports connects to the provided server using the given transport,
+// upgrades the response using the given upgrader to multiplexed bidirectional streams.
+func NewWebSocketExecutorForTransports(transport http.RoundTripper, upgrader spdy.Upgrader, url *url.URL) (Executor, error) {
+	return NewWebSocketExecutorForProtocols(
+		transport, upgrader, url,
+		remotecommand.StreamProtocolV4Name,
+		remotecommand.StreamProtocolV3Name,
+		remotecommand.StreamProtocolV2Name,
+		remotecommand.StreamProtocolV1Name,
+	)
+}
+
+// NewWebSocketExecutorForProtocols connects to the provided server and upgrades the connection to
+// multiplexed bidirectional streams using only the provided protocols. Exposed for testing, most
+// callers should use NewWebSocketExecutor or NewWebSocketExecutorForTransports.
+func NewWebSocketExecutorForProtocols(transport http.RoundTripper, upgrader spdy.Upgrader, url *url.URL, protocols ...string) (Executor, error) {
+	return &streamExecutor{
+		upgrader:  upgrader,
+		transport: transport,
+		url:       url,
+		protocols: protocols,
+	}, nil
+}
+
+// Stream opens a protocol streamer to the server and streams until a client closes
+// the connection or the server disconnects.
+func (e *streamExecutor) Stream(options StreamOptions) error {
+	req, err := http.NewRequest("POST", e.url.String(), nil)
+	fmt.Println(req)
+	fmt.Println(e.transport.RoundTrip(req))
+	if err != nil {
+		return fmt.Errorf("error creating request: %v", err)
+	}
+
+	return nil
 }
