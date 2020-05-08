@@ -18,7 +18,6 @@ package websocket
 
 import (
 	"crypto/tls"
-	"fmt"
 	"net/http"
 	"net/url"
 
@@ -37,9 +36,6 @@ type RoundTripper struct {
 	// websocket connection
 	conn *websocket.Conn
 
-	// knows how to dial the websocket server
-	Dialer *websocket.Dialer
-
 	// proxier knows which proxy to use given a request, defaults to http.ProxyFromEnvironment
 	// Used primarily for mocking the proxy discovery in tests.
 	proxier func(req *http.Request) (*url.URL, error)
@@ -56,6 +52,18 @@ func (wsRoundTripper *RoundTripper) NewConnection(resp *http.Response) (httpstre
 }
 
 func (wsRoundTripper *RoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
-	fmt.Println(request.Header)
-	return nil, nil
+
+	dialer := websocket.Dialer{
+		TLSClientConfig: wsRoundTripper.tlsConfig,
+	}
+
+	wsCon, resp, err := dialer.Dial(request.URL.String(), request.Header)
+
+	if err != nil {
+		return nil, err
+	}
+
+	wsRoundTripper.conn = wsCon
+
+	return resp, nil
 }

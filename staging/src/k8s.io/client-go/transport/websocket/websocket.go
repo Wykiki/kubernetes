@@ -54,18 +54,24 @@ func RoundTripperFor(config *restclient.Config) (http.RoundTripper, Upgrader, er
 // Negotiate opens a connection to a remote server and attempts to negotiate
 // a WebSocket connection. Upon success, it returns the connection and the protocol selected by
 // the server. The client transport must use the upgradeRoundTripper - see RoundTripperFor.
-func Negotiate(upgrader Upgrader, client *http.Client, req *http.Request, protocols ...string) error {
+func Negotiate(upgrader Upgrader, client *http.Client, req *http.Request, protocols ...string) (httpstream.Connection, string, error) {
 	for i := range protocols {
 		req.Header.Add(httpstream.HeaderProtocolVersion, protocols[i])
 	}
 	resp, err := client.Do(req)
+
 	if err != nil {
-		return fmt.Errorf("error sending request: %v", err)
+		return nil, "", fmt.Errorf("error sending request: %v", err)
 	}
+
 	defer resp.Body.Close()
-	_, err = upgrader.NewConnection(resp)
+
+	fmt.Println("RESPONSE")
+	fmt.Println(resp)
+
+	conn, err := upgrader.NewConnection(resp)
 	if err != nil {
-		return err
+		return nil, "", err
 	}
-	return nil
+	return conn, resp.Header.Get(httpstream.HeaderProtocolVersion), nil
 }

@@ -97,11 +97,25 @@ func NewWebSocketExecutorForProtocols(transport http.RoundTripper, upgrader spdy
 // the connection or the server disconnects.
 func (e *streamExecutor) Stream(options StreamOptions) error {
 	req, err := http.NewRequest("POST", e.url.String(), nil)
-	fmt.Println(req)
-	fmt.Println(e.transport.RoundTrip(req))
+	//fmt.Println(req)
+	//fmt.Println(e.transport.RoundTrip(req))
+	//if err != nil {
+	//	return fmt.Errorf("error creating request: %v", err)
+	//}
+
+	con, version, err := websocket.Negotiate(
+		e.upgrader,
+		&http.Client{Transport: e.transport},
+		req,
+		e.protocols...,
+	)
 	if err != nil {
-		return fmt.Errorf("error creating request: %v", err)
+		return err
 	}
+
+	fmt.Println(con)
+	fmt.Println(version)
+	fmt.Println(e.upgrader)
 
 	return nil
 }

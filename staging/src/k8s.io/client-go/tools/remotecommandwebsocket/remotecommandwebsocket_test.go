@@ -43,7 +43,7 @@ func TestMyCommand(t *testing.T) {
 
 	apiServerURL, err := url.Parse(config.Host)
 	fmt.Println(apiServerURL.Scheme)
-	// papiServerURL.Scheme = "wss"
+	apiServerURL.Scheme = "wss"
 	t.Log(apiServerURL)
 	if err != nil {
 		panic(err.Error())
@@ -91,7 +91,10 @@ func TestMyCommand(t *testing.T) {
 		TerminalSizeQueue: nil,
 	}
 
-	exec.Stream(streamOptions)
+	err = exec.Stream(streamOptions)
+	if err != nil {
+		t.Error(err)
+	}
 }
 
 func homeDir() string {
