@@ -25,6 +25,12 @@ import (
 	restclient "k8s.io/client-go/rest"
 )
 
+const (
+	// SecWebsocketProptocol is the response header from the API server
+	// that tells us which exec protocol to use
+	SecWebsocketProptocol = "Sec-Websocket-Protocol"
+)
+
 // Upgrader validates a response from the server after a WebSocket upgrade.
 type Upgrader interface {
 	// NewConnection validates the response and creates a new Connection.
@@ -66,12 +72,10 @@ func Negotiate(upgrader Upgrader, client *http.Client, req *http.Request, protoc
 
 	defer resp.Body.Close()
 
-	fmt.Println("RESPONSE")
-	fmt.Println(resp)
-
 	conn, err := upgrader.NewConnection(resp)
 	if err != nil {
 		return nil, "", err
 	}
-	return conn, resp.Header.Get(httpstream.HeaderProtocolVersion), nil
+
+	return conn, resp.Header.Get(SecWebsocketProptocol), nil
 }

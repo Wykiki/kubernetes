@@ -22,10 +22,11 @@ import (
 	"net/http"
 	"net/url"
 
+	"k8s.io/apimachinery/pkg/util/httpstream"
+	ws "k8s.io/apimachinery/pkg/util/httpstream/websocket"
 	"k8s.io/apimachinery/pkg/util/remotecommand"
 	restclient "k8s.io/client-go/rest"
 	remotecommandspdy "k8s.io/client-go/tools/remotecommand"
-	"k8s.io/client-go/transport/spdy"
 	"k8s.io/client-go/transport/websocket"
 )
 
@@ -54,6 +55,8 @@ type streamExecutor struct {
 	upgrader  websocket.Upgrader
 	transport http.RoundTripper
 
+	wsRoundTripper ws.RoundTripper
+
 	url       *url.URL
 	protocols []string
 }
@@ -71,7 +74,7 @@ func NewWebSocketExecutor(config *restclient.Config, url *url.URL) (Executor, er
 
 // NewWebSocketExecutorForTransports connects to the provided server using the given transport,
 // upgrades the response using the given upgrader to multiplexed bidirectional streams.
-func NewWebSocketExecutorForTransports(transport http.RoundTripper, upgrader spdy.Upgrader, url *url.URL) (Executor, error) {
+func NewWebSocketExecutorForTransports(transport http.RoundTripper, upgrader websocket.Upgrader, url *url.URL) (Executor, error) {
 	return NewWebSocketExecutorForProtocols(
 		transport, upgrader, url,
 		remotecommand.StreamProtocolV4Name,
@@ -84,7 +87,7 @@ func NewWebSocketExecutorForTransports(transport http.RoundTripper, upgrader spd
 // NewWebSocketExecutorForProtocols connects to the provided server and upgrades the connection to
 // multiplexed bidirectional streams using only the provided protocols. Exposed for testing, most
 // callers should use NewWebSocketExecutor or NewWebSocketExecutorForTransports.
-func NewWebSocketExecutorForProtocols(transport http.RoundTripper, upgrader spdy.Upgrader, url *url.URL, protocols ...string) (Executor, error) {
+func NewWebSocketExecutorForProtocols(transport http.RoundTripper, upgrader websocket.Upgrader, url *url.URL, protocols ...string) (Executor, error) {
 	return &streamExecutor{
 		upgrader:  upgrader,
 		transport: transport,
@@ -96,14 +99,11 @@ func NewWebSocketExecutorForProtocols(transport http.RoundTripper, upgrader spdy
 // Stream opens a protocol streamer to the server and streams until a client closes
 // the connection or the server disconnects.
 func (e *streamExecutor) Stream(options StreamOptions) error {
-	req, err := http.NewRequest("POST", e.url.String(), nil)
-	//fmt.Println(req)
-	//fmt.Println(e.transport.RoundTrip(req))
-	//if err != nil {
-	//	return fmt.Errorf("error creating request: %v", err)
-	//}
+	// Leverage the existing rest tools to get a connection with the corrrecet
+	// TLS and headers
+	req, err := http.NewRequest(httpstream.HeaderUpgrade, e.url.String(), nil)
 
-	con, version, err := websocket.Negotiate(
+	con, protocol, err := websocket.Negotiate(
 		e.upgrader,
 		&http.Client{Transport: e.transport},
 		req,
@@ -113,9 +113,14 @@ func (e *streamExecutor) Stream(options StreamOptions) error {
 		return err
 	}
 
-	fmt.Println(con)
-	fmt.Println(version)
-	fmt.Println(e.upgrader)
+	// cast the connection to a websocket to get the underlying connection
+	_, ok := con.(*ws.Connection)
+
+	if !ok {
+		panic("Connection is not a websocket connection")
+	}
+
+	fmt.Println(protocol)
 
 	return nil
 }

@@ -54,7 +54,7 @@ func TestMyCommand(t *testing.T) {
 		panic(err.Error())
 	}
 
-	pods, err := clientset.CoreV1().Pods("openunison").Get(context.TODO(), "openunison-orchestra-78858c5f4-8bnkb", metav1.GetOptions{})
+	pods, err := clientset.CoreV1().Pods("openunison").Get(context.TODO(), "openunison-orchestra-5687b447d6-6jzfl", metav1.GetOptions{})
 	if err != nil {
 		panic(err.Error())
 	}
