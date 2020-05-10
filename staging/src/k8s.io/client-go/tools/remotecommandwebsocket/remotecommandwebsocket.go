@@ -22,12 +22,14 @@ import (
 	"net/http"
 	"net/url"
 
+	gwebsocket "github.com/gorilla/websocket"
 	"k8s.io/apimachinery/pkg/util/httpstream"
 	ws "k8s.io/apimachinery/pkg/util/httpstream/websocket"
 	"k8s.io/apimachinery/pkg/util/remotecommand"
 	restclient "k8s.io/client-go/rest"
 	remotecommandspdy "k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/transport/websocket"
+	"k8s.io/klog"
 )
 
 // StreamOptions holds information pertaining to the current streaming session:
@@ -61,6 +63,10 @@ type streamExecutor struct {
 	protocols []string
 }
 
+type streamProtocolHandler interface {
+	stream(conn *gwebsocket.Conn) error
+}
+
 // NewWebSocketExecutor creates a new websocket connection to the URL specified with
 // the rest client's TLS configuration and headers
 func NewWebSocketExecutor(config *restclient.Config, url *url.URL) (Executor, error) {
@@ -77,11 +83,13 @@ func NewWebSocketExecutor(config *restclient.Config, url *url.URL) (Executor, er
 func NewWebSocketExecutorForTransports(transport http.RoundTripper, upgrader websocket.Upgrader, url *url.URL) (Executor, error) {
 	return NewWebSocketExecutorForProtocols(
 		transport, upgrader, url,
-		remotecommand.StreamProtocolV4Name,
-		remotecommand.StreamProtocolV3Name,
-		remotecommand.StreamProtocolV2Name,
+
 		remotecommand.StreamProtocolV1Name,
 	)
+
+	//remotecommand.StreamProtocolV4Name,
+	//	remotecommand.StreamProtocolV3Name,
+	//	remotecommand.StreamProtocolV2Name,
 }
 
 // NewWebSocketExecutorForProtocols connects to the provided server and upgrades the connection to
@@ -114,13 +122,30 @@ func (e *streamExecutor) Stream(options StreamOptions) error {
 	}
 
 	// cast the connection to a websocket to get the underlying connection
-	_, ok := con.(*ws.Connection)
+	conn, ok := con.(*ws.Connection)
 
 	if !ok {
 		panic("Connection is not a websocket connection")
 	}
 
+	var streamer streamProtocolHandler
+
 	fmt.Println(protocol)
 
-	return nil
+	switch protocol {
+	/*case remotecommand.StreamProtocolV4Name:
+		streamer = newStreamProtocolV4(options)
+	case remotecommand.StreamProtocolV3Name:
+		streamer = newStreamProtocolV3(options)
+	case remotecommand.StreamProtocolV2Name:
+		streamer = newStreamProtocolV2(options)*/
+	case "":
+		klog.V(4).Infof("The server did not negotiate a streaming protocol version. Falling back to %s", remotecommand.StreamProtocolV1Name)
+		fallthrough
+	case remotecommand.StreamProtocolV1Name:
+		streamer = newStreamProtocolV1(options)
+	}
+
+	return streamer.stream(conn.Conn)
+
 }

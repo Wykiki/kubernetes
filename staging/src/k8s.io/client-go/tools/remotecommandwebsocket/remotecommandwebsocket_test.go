@@ -64,13 +64,13 @@ func TestMyCommand(t *testing.T) {
 	apiServerURL.Path = pods.GetObjectMeta().GetSelfLink() + "/exec"
 
 	queryString := apiServerURL.Query()
-	queryString.Add("command", "bash")
-	//queryString.Add("command", "'test'")
+	queryString.Add("command", "echo")
+	queryString.Add("command", "'test,this is'")
 
 	queryString.Add("sterr", "true")
 	queryString.Add("stdout", "true")
-	queryString.Add("stdin", "true")
-	queryString.Add("tty", "true")
+	queryString.Add("stdin", "false")
+	queryString.Add("tty", "false")
 
 	apiServerURL.RawQuery = queryString.Encode()
 
