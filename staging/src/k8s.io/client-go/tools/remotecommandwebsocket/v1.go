@@ -17,6 +17,7 @@ limitations under the License.
 package remotecommandwebsocket
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -156,6 +157,9 @@ func (p *streamProtocolV1) stream(conn *websocket.Conn) error {
 
 	// pipes are connected, begin handling messages
 	go p.pullFromWebSocket(conn, doneChan)
+	if p.Stdin != nil {
+		go p.pushToWebSocket(conn)
+	}
 
 Loop:
 	for {
@@ -171,6 +175,25 @@ Loop:
 	}
 
 	return nil
+}
+
+func (p *streamProtocolV1) pushToWebSocket(conn *websocket.Conn) {
+	buffer := make([]byte, 1024)
+	reader := bufio.NewReaderSize(p.Stdin, 1024)
+	for {
+
+		numberOfBytesRead, err := reader.Read(buffer)
+		if err != nil {
+			panic(err)
+		}
+
+		data := make([]byte, numberOfBytesRead+1)
+		copy(data[1:], buffer[:])
+		data[0] = 0
+		p.remoteStdinOut.Write(data)
+
+	}
+
 }
 
 func (p *streamProtocolV1) pullFromWebSocket(conn *websocket.Conn, doneChan chan struct{}) {
