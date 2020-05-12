@@ -54,7 +54,8 @@ func TestMyCommand(t *testing.T) {
 		panic(err.Error())
 	}
 
-	pods, err := clientset.CoreV1().Pods("openunison").Get(context.TODO(), "openunison-orchestra-5687b447d6-6jzfl", metav1.GetOptions{})
+	pods, err := clientset.CoreV1().Pods("openunison").Get(context.TODO(), "openunison-orchestra-9dc495fb4-98rv4", metav1.GetOptions{})
+	//pods, err := clientset.CoreV1().Pods("openunison").Get(context.TODO(), "openunison-orchestra-5687b447d6-6jzfl", metav1.GetOptions{})
 	if err != nil {
 		panic(err.Error())
 	}
@@ -84,10 +85,10 @@ func TestMyCommand(t *testing.T) {
 	t.Log(exec)
 
 	streamOptions := StreamOptions{
-		Stdin:             os.Stdin,
+		Stdin:             nil,
 		Stdout:            os.Stdout,
 		Stderr:            os.Stderr,
-		Tty:               true,
+		Tty:               false,
 		TerminalSizeQueue: nil,
 	}
 

@@ -17,7 +17,6 @@ limitations under the License.
 package remotecommandwebsocket
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -28,22 +27,7 @@ import (
 	"k8s.io/klog"
 )
 
-const (
-	// Time allowed to write a message to the peer.
-	writeWait = 10 * time.Second
-
-	// Maximum message size allowed from peer.
-	maxMessageSize = 8192
-
-	// Time allowed to read the next pong message from the peer.
-	pongWait = 60 * time.Second
-
-	// Send pings to peer with this period. Must be less than pongWait.
-	pingPeriod = (pongWait * 9) / 10
-
-	// Time to wait before force close on connection.
-	closeGracePeriod = 10 * time.Second
-)
+const ()
 
 // streamProtocolV1 implements the first version of the streaming exec & attach
 // protocol. This version has some bugs, such as not being able to detect when
@@ -74,6 +58,7 @@ func newStreamProtocolV1(options StreamOptions) streamProtocolHandler {
 }
 
 func (p *streamProtocolV1) stream(conn *websocket.Conn) error {
+	defer conn.Close()
 	doneChan := make(chan struct{}, 2)
 	errorChan := make(chan error)
 
@@ -102,25 +87,17 @@ func (p *streamProtocolV1) stream(conn *websocket.Conn) error {
 	// process data before the client starts sending any. See https://issues.k8s.io/16373 for more info.
 	if p.Stdin != nil {
 		p.remoteStdinIn, p.remoteStdinOut = io.Pipe()
-
-		//defer p.remoteStdin.Reset()
 	}
 
 	if p.Stdout != nil {
 		p.remoteStdoutIn, p.remoteStdoutOut = io.Pipe()
-
-		//defer p.remoteStdout.Reset()
 	}
 
 	if p.Stderr != nil && !p.Tty {
-
 		p.remoteStderrIn, p.remoteStderrOut = io.Pipe()
-
-		//defer p.remoteStderr.Reset()
 	}
 
 	// now that all the streams have been created, proceed with reading & copying
-
 	// always read from errorStream
 	go func() {
 		message, err := ioutil.ReadAll(p.errorStreamIn)
@@ -155,10 +132,14 @@ func (p *streamProtocolV1) stream(conn *websocket.Conn) error {
 		go cp(v1.StreamTypeStderr, p.Stderr, p.remoteStderrIn)
 	}
 
+	// setup pings to keep the connection alive during long operations
+	go p.ping(conn, doneChan)
+	waitCount++
+
 	// pipes are connected, begin handling messages
 	go p.pullFromWebSocket(conn, doneChan)
 	if p.Stdin != nil {
-		go p.pushToWebSocket(conn)
+		go p.pushToWebSocket(conn, doneChan)
 	}
 
 Loop:
@@ -177,19 +158,23 @@ Loop:
 	return nil
 }
 
-func (p *streamProtocolV1) pushToWebSocket(conn *websocket.Conn) {
+func (p *streamProtocolV1) pushToWebSocket(conn *websocket.Conn, doneChan chan struct{}) {
 	buffer := make([]byte, 1024)
-	reader := bufio.NewReaderSize(p.Stdin, 1024)
+
 	for {
 
-		numberOfBytesRead, err := reader.Read(buffer)
+		numberOfBytesRead, err := p.StreamOptions.Stdin.Read(buffer)
 		if err != nil {
-			panic(err)
+			if err == io.EOF {
+				doneChan <- struct{}{}
+			} else {
+				panic(err)
+			}
 		}
 
 		data := make([]byte, numberOfBytesRead+1)
 		copy(data[1:], buffer[:])
-		data[0] = 0
+		data[0] = StreamStdIn
 		p.remoteStdinOut.Write(data)
 
 	}
@@ -197,7 +182,7 @@ func (p *streamProtocolV1) pushToWebSocket(conn *websocket.Conn) {
 }
 
 func (p *streamProtocolV1) pullFromWebSocket(conn *websocket.Conn, doneChan chan struct{}) {
-	defer conn.Close()
+
 	conn.SetReadLimit(maxMessageSize)
 	conn.SetReadDeadline(time.Now().Add(pongWait))
 	conn.SetPongHandler(func(string) error { conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
@@ -207,25 +192,48 @@ func (p *streamProtocolV1) pullFromWebSocket(conn *websocket.Conn, doneChan chan
 		if messageType > 0 {
 
 			switch message[0] {
-			case 1:
+			case StreamStdOut:
 
 				if _, err := p.remoteStdoutOut.Write(message[1:]); err != nil {
-					break
+					panic(err)
 				}
-			case 2:
+			case StreamStdErr:
 				if _, err := p.remoteStderrOut.Write(message[1:]); err != nil {
-					break
+					panic(err)
 				}
-			case 3:
+			case StreamErr:
 				if _, err := p.errorStreamOut.Write(message[1:]); err != nil {
-					break
+					panic(err)
 				}
 			}
 
 		}
 
 		if err != nil {
-			doneChan <- struct{}{}
+			websocketErr, ok := err.(*websocket.CloseError)
+			if ok {
+				if websocketErr.Code == WebSocketExitStream {
+					doneChan <- struct{}{}
+				} else {
+					panic(err)
+				}
+			} else {
+				panic(err)
+			}
+		}
+	}
+}
+
+func (p *streamProtocolV1) ping(ws *websocket.Conn, done chan struct{}) {
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := ws.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
+				panic(err)
+			}
+		case <-done:
 			return
 		}
 	}
