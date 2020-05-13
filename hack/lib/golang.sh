@@ -674,6 +674,9 @@ kube::golang::build_some_binaries() {
 }
 
 kube::golang::build_binaries_for_platform() {
+  # This is for sanity.  Without it, user umasks can leak through.
+  umask 0022
+
   local platform=$1
 
   local -a statics=()

@@ -322,7 +322,7 @@ function install-exec-auth-plugin {
   local -r license_url="${EXEC_AUTH_PLUGIN_LICENSE_URL}"
   echo "Downloading gke-exec-auth-plugin license"
   download-or-bust "" "${license_url}"
-  mv "${KUBE_HOME}/LICENSE" "${KUBE_BIN}/gke-exec-auth-plugin-license"
+  mv "${KUBE_HOME}/LICENSES/LICENSE" "${KUBE_BIN}/gke-exec-auth-plugin-license"
 }
 
 function install-kube-manifests {
@@ -573,6 +573,9 @@ function install-kube-binary-config {
     mv "${src_dir}/kubelet" "${KUBE_BIN}"
     mv "${src_dir}/kubectl" "${KUBE_BIN}"
 
+    # Some older images have LICENSES baked-in as a file. Presumably they will
+    # have the directory baked-in eventually.
+    rm -rf "${KUBE_HOME}"/LICENSES
     mv "${KUBE_HOME}/kubernetes/LICENSES" "${KUBE_HOME}"
     mv "${KUBE_HOME}/kubernetes/kubernetes-src.tar.gz" "${KUBE_HOME}"
   fi

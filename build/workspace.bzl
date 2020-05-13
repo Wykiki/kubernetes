@@ -50,7 +50,7 @@ _ETCD_TARBALL_ARCH_SHA256 = {
 def release_dependencies():
     cni_tarballs()
     cri_tarballs()
-    debian_image_dependencies()
+    image_dependencies()
     etcd_tarballs()
 
 def cni_tarballs():
@@ -71,7 +71,11 @@ def cri_tarballs():
             urls = mirror("https://github.com/kubernetes-incubator/cri-tools/releases/download/v%s/crictl-v%s-%s.tar.gz" % (CRI_TOOLS_VERSION, CRI_TOOLS_VERSION, arch)),
         )
 
-# Use go get -u github.com/estesp/manifest-tool to find these values
+# Use skopeo to find these values: https://github.com/containers/skopeo
+#
+# Example
+# Manifest: skopeo inspect docker://gcr.io/k8s-staging-build-image/debian-base:v2.1.0
+# Arches: skopeo inspect --raw docker://gcr.io/k8s-staging-build-image/debian-base:v2.1.0
 _DEBIAN_BASE_DIGEST = {
     "manifest": "sha256:b118abac0bcf633b9db4086584ee718526fe394cf1bd18aee036e6cc497860f6",
     "amd64": "sha256:a67798e4746faaab3fde5b7407fa8bba75d8b1214d168dc7ad2b5364f6fc4319",
@@ -81,13 +85,32 @@ _DEBIAN_BASE_DIGEST = {
     "s390x": "sha256:dac908eaa61d2034aec252576a470a7e4ab184c361f89170526f707a0c3c6082",
 }
 
+# Use skopeo to find these values: https://github.com/containers/skopeo
+#
+# Example
+# Manifest: skopeo inspect docker://gcr.io/k8s-staging-build-image/debian-iptables:v12.1.0
+# Arches: skopeo inspect --raw docker://gcr.io/k8s-staging-build-image/debian-iptables:v12.1.0
 _DEBIAN_IPTABLES_DIGEST = {
-    "manifest": "sha256:d1cd487e89fb4cba853cd3a948a6e9016faf66f2a7bb53cb1ac6b6c9cb58f5ed",
-    "amd64": "sha256:852d3c569932059bcab3a52cb6105c432d85b4b7bbd5fc93153b78010e34a783",
-    "arm": "sha256:c10f01b414a7cd4b2f3e26e152c90c64a1e781d99f83a6809764cf74ecbc46c3",
-    "arm64": "sha256:5725e6fde13a6405cf800e22846ebd2bde24b0860f1dc3f6f5f256f03cfa85bd",
-    "ppc64le": "sha256:b6d6e56a0c34c0393dcba0d5faaa531b92e5876114c5ab5a90e82e4889724c5a",
-    "s390x": "sha256:39e67e9bf25d67fe35bd9dcb25367277e5967368e02f2741e0efd4ce8874db14",
+    "manifest": "sha256:1ae6d76dea462973759ff1c4e02263867da1f85db9aa10462a030ca421cbf0e9",
+    "amd64": "sha256:2fb9fa09123a41e6369cac04eb29e26237fe9e43da8e18f676d18d8fffb906fc",
+    "arm": "sha256:a0e97386c073a2990265938fa15dc0db575efdb4d13c0ea63a79e0590813a998",
+    "arm64": "sha256:2a7df97e2c702d9852cc6234aff89b4671cd5b09086ac2b5383411315e5f115d",
+    "ppc64le": "sha256:f5289a6494328b7ccb695e3add65b33ca380b77fcfc9715e474f0efe26e1c506",
+    "s390x": "sha256:1b91a2788750552913377bf1bc99a095544dfb523d80a55674003c974c8e0905",
+}
+
+# Use skopeo to find these values: https://github.com/containers/skopeo
+#
+# Example
+# Manifest: skopeo inspect docker://gcr.io/k8s-staging-build-image/go-runner:v0.1.1
+# Arches: skopeo inspect --raw docker://gcr.io/k8s-staging-build-image/go-runner:v0.1.1
+_GO_RUNNER_DIGEST = {
+    "manifest": "sha256:4892faa2de0533bc1af72b9b233936f21a9e7362063345d170de1a8f464f2ad8",
+    "amd64": "sha256:821e48a96d46aa53d2f7f5ef9d9093ed69979957a0a7092d1c09c44d81028a9d",
+    "arm": "sha256:2cc042179887b6baa0792e156b53f4cb94181b1a99153790402bd8e517e8cf56",
+    "arm64": "sha256:00ca7f34275349330a5d8ddffd15e2980fe5b2cbdd410f063f4e7617e0e71c29",
+    "ppc64le": "sha256:3e25e0d0e9d17033f3e86d4af5787c7fc5f1173e174d77eebdc14df1a06f1c99",
+    "s390x": "sha256:3e34e290cd35a90285991a575e2e79fddfb161c66f13bc5662a1cc0a4ade32e0",
 }
 
 def _digest(d, arch):
@@ -96,14 +119,24 @@ def _digest(d, arch):
         return d["manifest"]
     return d[arch]
 
-def debian_image_dependencies():
+def image_dependencies():
     for arch in SERVER_PLATFORMS["linux"]:
+        container_pull(
+            name = "go-runner-linux-" + arch,
+            architecture = arch,
+            digest = _digest(_GO_RUNNER_DIGEST, arch),
+            registry = "us.gcr.io/k8s-artifacts-prod/build-image",
+            repository = "go-runner",
+            tag = "v0.1.1",  # ignored, but kept here for documentation
+        )
+
         container_pull(
             name = "debian-base-" + arch,
             architecture = arch,
             digest = _digest(_DEBIAN_BASE_DIGEST, arch),
             registry = "us.gcr.io/k8s-artifacts-prod/build-image",
             repository = "debian-base",
+            # Ensure the digests above are updated to match a new tag
             tag = "v2.1.0",  # ignored, but kept here for documentation
         )
 
@@ -111,9 +144,10 @@ def debian_image_dependencies():
             name = "debian-iptables-" + arch,
             architecture = arch,
             digest = _digest(_DEBIAN_IPTABLES_DIGEST, arch),
-            registry = "k8s.gcr.io",
+            registry = "us.gcr.io/k8s-artifacts-prod/build-image",
             repository = "debian-iptables",
-            tag = "v12.0.1",  # ignored, but kept here for documentation
+            # Ensure the digests above are updated to match a new tag
+            tag = "v12.1.0",  # ignored, but kept here for documentation
         )
 
 def etcd_tarballs():
