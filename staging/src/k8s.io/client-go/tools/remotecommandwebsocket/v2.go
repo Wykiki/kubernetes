@@ -66,7 +66,7 @@ func (p *streamProtocolV2) copyStdin() {
 			// if p.stdin is noninteractive, p.g. `echo abc | kubectl exec -i <pod> -- cat`, make sure
 			// we close remoteStdin as soon as the copy from p.stdin to remoteStdin finishes. Otherwise
 			// the executed command will remain running.
-			defer once.Do(func() { p.remoteStdin.Close() })
+			defer once.Do(func() { p.remoteStdinIn.Close() })
 
 			if _, err := io.Copy(p.remoteStdinOut, readerWrapper{p.Stdin}); err != nil {
 				runtime.HandleError(err)
@@ -89,7 +89,7 @@ func (p *streamProtocolV2) copyStdin() {
 		// allow the copy in hijack to complete, and hijack to return.
 		go func() {
 			defer runtime.HandleCrash()
-			defer once.Do(func() { p.remoteStdin.Close() })
+			defer once.Do(func() { p.remoteStdinIn.Close() })
 
 			// this "copy" doesn't actually read anything - it's just here to wait for
 			// the server to close remoteStdin.
@@ -133,6 +133,9 @@ func (p *streamProtocolV2) copyStderr(wg *sync.WaitGroup) {
 }
 
 func (p *streamProtocolV2) stream(conn *websocket.Conn) error {
+	defer conn.Close()
+	doneChan := make(chan struct{}, 2)
+
 	// set up error stream
 	p.errorStreamIn, p.errorStreamOut = io.Pipe()
 
@@ -153,7 +156,7 @@ func (p *streamProtocolV2) stream(conn *websocket.Conn) error {
 
 	// now that all the streams have been created, proceed with reading & copying
 
-	errorChan := watchErrorStream(p.errorStream, &errorDecoderV2{})
+	errorChan := watchErrorStream(p.errorStreamIn, &errorDecoderV2{})
 
 	p.copyStdin()
 
@@ -161,11 +164,21 @@ func (p *streamProtocolV2) stream(conn *websocket.Conn) error {
 	p.copyStdout(&wg)
 	p.copyStderr(&wg)
 
+	//start streaming to the api server
+	p.pullFromWebSocket(conn, &wg)
+	p.pushToWebSocket(conn, &wg)
+	p.ping(conn, doneChan)
+
 	// we're waiting for stdout/stderr to finish copying
 	wg.Wait()
 
 	// waits for errorStream to finish reading with an error or nil
-	return <-errorChan
+	<-errorChan
+
+	// notify the ping function to stop
+	doneChan <- struct{}{}
+
+	return
 }
 
 // errorDecoderV2 interprets the error channel data as plain text.
@@ -175,7 +188,37 @@ func (d *errorDecoderV2) decode(message []byte) error {
 	return fmt.Errorf("error executing remote command: %s", message)
 }
 
-func (p *streamProtocolV1) pullFromWebSocket(conn *websocket.Conn, wg *sync.WaitGroup) {
+func (p *streamProtocolV2) pushToWebSocket(conn *websocket.Conn, wg *sync.WaitGroup) {
+	wg.Add(1)
+
+	go func() {
+		defer runtime.HandleCrash()
+		defer wg.Done()
+
+		buffer := make([]byte, 1024)
+
+		for {
+
+			numberOfBytesRead, err := p.StreamOptions.Stdin.Read(buffer)
+			if err != nil {
+				if err == io.EOF {
+					return
+				} else {
+					runtime.HandleError(err)
+				}
+			}
+
+			data := make([]byte, numberOfBytesRead+1)
+			copy(data[1:], buffer[:])
+			data[0] = StreamStdIn
+			p.remoteStdinOut.Write(data)
+
+		}
+	}()
+
+}
+
+func (p *streamProtocolV2) pullFromWebSocket(conn *websocket.Conn, wg *sync.WaitGroup) {
 	wg.Add(1)
 
 	go func() {
@@ -193,15 +236,15 @@ func (p *streamProtocolV1) pullFromWebSocket(conn *websocket.Conn, wg *sync.Wait
 				case StreamStdOut:
 
 					if _, err := p.remoteStdoutOut.Write(message[1:]); err != nil {
-						panic(err)
+						runtime.HandleError(err)
 					}
 				case StreamStdErr:
 					if _, err := p.remoteStderrOut.Write(message[1:]); err != nil {
-						panic(err)
+						runtime.HandleError(err)
 					}
 				case StreamErr:
 					if _, err := p.errorStreamOut.Write(message[1:]); err != nil {
-						panic(err)
+						runtime.HandleError(err)
 					}
 				}
 
@@ -213,27 +256,29 @@ func (p *streamProtocolV1) pullFromWebSocket(conn *websocket.Conn, wg *sync.Wait
 					if websocketErr.Code == WebSocketExitStream {
 						return
 					} else {
-						panic(err)
+						runtime.HandleError(err)
 					}
 				} else {
 					panic(err)
 				}
 			}
 		}
-	}
+	}()
 }
 
-func (p *streamProtocolV1) ping(ws *websocket.Conn, done chan struct{}) {
-	ticker := time.NewTicker(pingPeriod)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			if err := ws.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
-				panic(err)
+func (p *streamProtocolV2) ping(ws *websocket.Conn, done chan struct{}) {
+	go func() {
+		ticker := time.NewTicker(pingPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := ws.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
+					runtime.HandleError(err)
+				}
+			case <-done:
+				return
 			}
-		case <-done:
-			return
 		}
-	}
+	}()
 }
