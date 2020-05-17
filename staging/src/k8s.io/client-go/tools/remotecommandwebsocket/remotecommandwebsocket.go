@@ -44,6 +44,18 @@ const (
 	StreamErr = 3
 	// StreamResize represents the resize stream
 	StreamResize = 4
+
+	// Base64StreamStdIn represents the remote stdin stream
+	Base64StreamStdIn = 48
+	// Base64StreamStdOut represents the remote stdout stream
+	Base64StreamStdOut = 49
+	// Base64StreamStdErr represents the remote stderr stream
+	Base64StreamStdErr = 50
+	// Base64StreamErr respresents the remote error stream
+	Base64StreamErr = 51
+	// Base64StreamResize represents the resize stream
+	Base64StreamResize = 52
+
 	// WebSocketExitStream is the error code that represents a clean exit from the stream
 	WebSocketExitStream = 1000
 
@@ -61,6 +73,11 @@ const (
 
 	// Time to wait before force close on connection.
 	closeGracePeriod = 10 * time.Second
+
+	preV4BinaryWebsocketProtocol = "channel.k8s.io"
+	preV4Base64WebsocketProtocol = "base64.channel.k8s.io"
+	v4BinaryWebsocketProtocol    = "v4." + preV4BinaryWebsocketProtocol
+	v4Base64WebsocketProtocol    = "v4." + preV4Base64WebsocketProtocol
 )
 
 // StreamOptions holds information pertaining to the current streaming session:
@@ -114,8 +131,8 @@ func NewWebSocketExecutor(config *restclient.Config, url *url.URL) (Executor, er
 func NewWebSocketExecutorForTransports(transport http.RoundTripper, upgrader websocket.Upgrader, url *url.URL) (Executor, error) {
 	return NewWebSocketExecutorForProtocols(
 		transport, upgrader, url,
-
-		remotecommand.StreamProtocolV1Name,
+		preV4BinaryWebsocketProtocol,
+		preV4Base64WebsocketProtocol,
 	)
 
 	//remotecommand.StreamProtocolV4Name,
@@ -161,20 +178,21 @@ func (e *streamExecutor) Stream(options StreamOptions) error {
 
 	var streamer streamProtocolHandler
 
+	fmt.Println("Protocol:")
 	fmt.Println(protocol)
 
 	switch protocol {
 	/*case remotecommand.StreamProtocolV4Name:
 		streamer = newStreamProtocolV4(options)
 	case remotecommand.StreamProtocolV3Name:
-		streamer = newStreamProtocolV3(options)
-	case remotecommand.StreamProtocolV2Name:
-		streamer = newStreamProtocolV2(options)*/
+		streamer = newStreamProtocolV3(options)*/
+	case preV4Base64WebsocketProtocol:
+		streamer = newPreV4Base64Protocol(options)
 	case "":
 		klog.V(4).Infof("The server did not negotiate a streaming protocol version. Falling back to %s", remotecommand.StreamProtocolV1Name)
 		fallthrough
-	case remotecommand.StreamProtocolV1Name:
-		streamer = newStreamProtocolV1(options)
+	case preV4BinaryWebsocketProtocol:
+		streamer = newPreV4BinaryProtocol(options)
 	}
 
 	return streamer.stream(conn.Conn)

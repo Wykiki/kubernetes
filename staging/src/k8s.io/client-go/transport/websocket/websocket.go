@@ -77,5 +77,7 @@ func Negotiate(upgrader Upgrader, client *http.Client, req *http.Request, protoc
 		return nil, "", err
 	}
 
+	fmt.Println(resp.Header)
+
 	return conn, resp.Header.Get(SecWebsocketProptocol), nil
 }
