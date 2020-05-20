@@ -25,7 +25,7 @@ import (
 	"runtime"
 	"time"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/mount"
 	utilstrings "k8s.io/utils/strings"
 
@@ -183,7 +183,13 @@ func (plugin *azureFilePlugin) ExpandVolumeDevice(
 		return oldSize, err
 	}
 
-	if err := azure.ResizeFileShare(resourceGroup, accountName, shareName, int(volumehelpers.RoundUpToGiB(newSize))); err != nil {
+	requestGiB, err := volumehelpers.RoundUpToGiBInt(newSize)
+
+	if err != nil {
+		return oldSize, err
+	}
+
+	if err := azure.ResizeFileShare(resourceGroup, accountName, shareName, requestGiB); err != nil {
 		return oldSize, err
 	}
 

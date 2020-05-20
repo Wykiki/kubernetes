@@ -23,7 +23,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
 )
@@ -75,10 +75,6 @@ func NewRequestedToCapacityRatio(plArgs runtime.Object, handle framework.Framewo
 			// Apply the default weight.
 			resourceToWeightMap[v1.ResourceName(resource.Name)] = 1
 		}
-	}
-	if len(args.Resources) == 0 {
-		// If no resources specified, used the default set.
-		resourceToWeightMap = defaultRequestedRatioResources
 	}
 
 	return &RequestedToCapacityRatio{

@@ -62,11 +62,13 @@ type CreateJobOptions struct {
 	From    string
 	Command []string
 
-	Namespace      string
-	Client         batchv1client.BatchV1Interface
-	DryRunStrategy cmdutil.DryRunStrategy
-	DryRunVerifier *resource.DryRunVerifier
-	Builder        *resource.Builder
+	Namespace        string
+	EnforceNamespace bool
+	Client           batchv1client.BatchV1Interface
+	DryRunStrategy   cmdutil.DryRunStrategy
+	DryRunVerifier   *resource.DryRunVerifier
+	Builder          *resource.Builder
+	FieldManager     string
 
 	genericclioptions.IOStreams
 }
@@ -101,7 +103,7 @@ func NewCmdCreateJob(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *
 	cmdutil.AddDryRunFlag(cmd)
 	cmd.Flags().StringVar(&o.Image, "image", o.Image, "Image name to run.")
 	cmd.Flags().StringVar(&o.From, "from", o.From, "The name of the resource to create a Job from (only cronjob is supported).")
-
+	cmdutil.AddFieldManagerFlagVar(cmd, &o.FieldManager, "kubectl-create")
 	return cmd
 }
 
@@ -125,7 +127,7 @@ func (o *CreateJobOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args 
 		return err
 	}
 
-	o.Namespace, _, err = f.ToRawKubeConfigLoader().Namespace()
+	o.Namespace, o.EnforceNamespace, err = f.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
 		return err
 	}
@@ -201,6 +203,9 @@ func (o *CreateJobOptions) Run() error {
 	}
 	if o.DryRunStrategy != cmdutil.DryRunClient {
 		createOptions := metav1.CreateOptions{}
+		if o.FieldManager != "" {
+			createOptions.FieldManager = o.FieldManager
+		}
 		if o.DryRunStrategy == cmdutil.DryRunServer {
 			if err := o.DryRunVerifier.HasSupport(job.GroupVersionKind()); err != nil {
 				return err
@@ -218,7 +223,7 @@ func (o *CreateJobOptions) Run() error {
 }
 
 func (o *CreateJobOptions) createJob() *batchv1.Job {
-	return &batchv1.Job{
+	job := &batchv1.Job{
 		// this is ok because we know exactly how we want to be serialized
 		TypeMeta: metav1.TypeMeta{APIVersion: batchv1.SchemeGroupVersion.String(), Kind: "Job"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -239,6 +244,10 @@ func (o *CreateJobOptions) createJob() *batchv1.Job {
 			},
 		},
 	}
+	if o.EnforceNamespace {
+		job.Namespace = o.Namespace
+	}
+	return job
 }
 
 func (o *CreateJobOptions) createJobFromCronJob(cronJob *batchv1beta1.CronJob) *batchv1.Job {
@@ -248,7 +257,7 @@ func (o *CreateJobOptions) createJobFromCronJob(cronJob *batchv1beta1.CronJob) *
 		annotations[k] = v
 	}
 
-	return &batchv1.Job{
+	job := &batchv1.Job{
 		// this is ok because we know exactly how we want to be serialized
 		TypeMeta: metav1.TypeMeta{APIVersion: batchv1.SchemeGroupVersion.String(), Kind: "Job"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -266,4 +275,8 @@ func (o *CreateJobOptions) createJobFromCronJob(cronJob *batchv1beta1.CronJob) *
 		},
 		Spec: cronJob.Spec.JobTemplate.Spec,
 	}
+	if o.EnforceNamespace {
+		job.Namespace = o.Namespace
+	}
+	return job
 }

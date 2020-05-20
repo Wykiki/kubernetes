@@ -58,11 +58,13 @@ type CreateCronJobOptions struct {
 	Command  []string
 	Restart  string
 
-	Namespace      string
-	Client         batchv1beta1client.BatchV1beta1Interface
-	DryRunStrategy cmdutil.DryRunStrategy
-	DryRunVerifier *resource.DryRunVerifier
-	Builder        *resource.Builder
+	Namespace        string
+	EnforceNamespace bool
+	Client           batchv1beta1client.BatchV1beta1Interface
+	DryRunStrategy   cmdutil.DryRunStrategy
+	DryRunVerifier   *resource.DryRunVerifier
+	Builder          *resource.Builder
+	FieldManager     string
 
 	genericclioptions.IOStreams
 }
@@ -98,6 +100,7 @@ func NewCmdCreateCronJob(f cmdutil.Factory, ioStreams genericclioptions.IOStream
 	cmd.Flags().StringVar(&o.Image, "image", o.Image, "Image name to run.")
 	cmd.Flags().StringVar(&o.Schedule, "schedule", o.Schedule, "A schedule in the Cron format the job should be run with.")
 	cmd.Flags().StringVar(&o.Restart, "restart", o.Restart, "job's restart policy. supported values: OnFailure, Never")
+	cmdutil.AddFieldManagerFlagVar(cmd, &o.FieldManager, "kubectl-create")
 
 	return cmd
 }
@@ -124,7 +127,7 @@ func (o *CreateCronJobOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, a
 		return err
 	}
 
-	o.Namespace, _, err = f.ToRawKubeConfigLoader().Namespace()
+	o.Namespace, o.EnforceNamespace, err = f.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
 		return err
 	}
@@ -171,6 +174,9 @@ func (o *CreateCronJobOptions) Run() error {
 
 	if o.DryRunStrategy != cmdutil.DryRunClient {
 		createOptions := metav1.CreateOptions{}
+		if o.FieldManager != "" {
+			createOptions.FieldManager = o.FieldManager
+		}
 		if o.DryRunStrategy == cmdutil.DryRunServer {
 			if err := o.DryRunVerifier.HasSupport(cronjob.GroupVersionKind()); err != nil {
 				return err
@@ -188,7 +194,7 @@ func (o *CreateCronJobOptions) Run() error {
 }
 
 func (o *CreateCronJobOptions) createCronJob() *batchv1beta1.CronJob {
-	return &batchv1beta1.CronJob{
+	cronjob := &batchv1beta1.CronJob{
 		TypeMeta: metav1.TypeMeta{APIVersion: batchv1beta1.SchemeGroupVersion.String(), Kind: "CronJob"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: o.Name,
@@ -216,4 +222,8 @@ func (o *CreateCronJobOptions) createCronJob() *batchv1beta1.CronJob {
 			},
 		},
 	}
+	if o.EnforceNamespace {
+		cronjob.Namespace = o.Namespace
+	}
+	return cronjob
 }
