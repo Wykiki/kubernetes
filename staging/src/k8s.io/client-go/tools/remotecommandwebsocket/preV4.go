@@ -128,7 +128,7 @@ func (p *preV4Protocol) stream(conn *websocket.Conn) error {
 		// because stdin is not closed until the process exits. If we try to call
 		// stdin.Close(), it returns no error but doesn't unblock the copy. It will
 		// exit when the process exits, instead.
-		go cp(v1.StreamTypeStdin, p.remoteStdinOut, readerWrapper{p.Stdin})
+		go cp(v1.StreamTypeStdin, p.remoteStdinOut, readerWrapper{p.remoteStdinIn})
 	}
 
 	waitCount := 0
@@ -187,7 +187,11 @@ func (p *preV4Protocol) pushToWebSocket(conn *websocket.Conn, doneChan chan stru
 		data := make([]byte, numberOfBytesRead+1)
 		copy(data[1:], buffer[:])
 		data[0] = StreamStdIn
-		p.remoteStdinOut.Write(data)
+
+		err = conn.WriteMessage(websocket.BinaryMessage, data)
+		if err != nil {
+			panic(err)
+		}
 
 	}
 
