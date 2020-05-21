@@ -2,8 +2,6 @@ package remotecommandwebsocket
 
 import (
 	"bufio"
-	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -18,6 +16,9 @@ type testServer struct {
 	t             *testing.T
 	wg            *sync.WaitGroup
 	streamOptions *StreamOptions
+
+	wsClient *websocket.Conn
+	wsServer *websocket.Conn
 
 	stdinPassed  bool
 	stdoutPassed bool
@@ -36,9 +37,8 @@ const (
 )
 
 func TestPreV4Binary(t *testing.T) {
-	t.Log("here")
-	m := http.NewServeMux()
 
+	m := http.NewServeMux()
 	s := &testServer{
 		httpServer:   &http.Server{Addr: "127.0.0.1:8765", Handler: m},
 		t:            t,
@@ -47,10 +47,46 @@ func TestPreV4Binary(t *testing.T) {
 		stdinPassed:  false,
 		stdoutPassed: false,
 	}
+	m.HandleFunc("/wsbinary", s.wsBinary)
 
-	stdinin, stdinout := io.Pipe()
-	_, stdoutout := io.Pipe()
-	_, stderrout := io.Pipe()
+	go s.httpServer.ListenAndServe()
+
+	time.Sleep(2 * time.Second)
+
+	runTestCase(t, true, true, true, s)
+	runTestCase(t, true, true, false, s)
+	runTestCase(t, true, false, true, s)
+	/*runTestCase(t, false, true, true, s)
+	runTestCase(t, false, false, true, s)
+	runTestCase(t, true, false, false, s)
+	runTestCase(t, false, true, false, s)
+	runTestCase(t, false, false, false, s)*/
+
+}
+
+func runTestCase(t *testing.T, runStdIn bool, runStdOut bool, runStdErr bool, s *testServer) {
+	t.Logf("Test Case - stdin : %t / stdout: %t / stederr : %t", runStdIn, runStdOut, runStdErr)
+
+	doneChan := make(chan struct{}, 2)
+
+	s.stdinPassed = false
+	s.stdoutPassed = false
+	s.stderrPassed = false
+
+	var stdinin io.Reader
+	var stdoutout, stderrout, stdinout io.Writer
+
+	if runStdIn {
+		stdinin, stdinout = io.Pipe()
+	}
+
+	if runStdOut {
+		_, stdoutout = io.Pipe()
+	}
+
+	if runStdErr {
+		_, stderrout = io.Pipe()
+	}
 
 	s.streamOptions = &StreamOptions{
 		Stdin:             stdinin,
@@ -60,14 +96,8 @@ func TestPreV4Binary(t *testing.T) {
 		TerminalSizeQueue: nil,
 	}
 
-	m.HandleFunc("/wsbinary", s.wsBinary)
-
-	go s.httpServer.ListenAndServe()
-
-	time.Sleep(2 * time.Second)
-
 	conn, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:8765/wsbinary", nil)
-
+	s.wsClient = conn
 	if err != nil {
 		panic(err)
 	}
@@ -75,44 +105,54 @@ func TestPreV4Binary(t *testing.T) {
 	streamer := newPreV4BinaryProtocol(*s.streamOptions)
 	go streamer.stream(conn)
 
-	// write to standard in
-	stdinbuf := bufio.NewWriter(stdinout)
-	bytes, err := stdinbuf.Write([]byte(stdinTestData))
-	t.Log(bytes)
-	if err != nil {
-		panic(err)
-	}
-	err = stdinbuf.Flush()
-	if err != nil {
-		panic(err)
+	if s.streamOptions.Stdin != nil {
+		// write to standard in
+		stdinbuf := bufio.NewWriter(stdinout)
+		_, err = stdinbuf.Write([]byte(stdinTestData))
+
+		if err != nil {
+			panic(err)
+		}
+		err = stdinbuf.Flush()
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	if s.streamOptions.Stdout != nil || s.streamOptions.Stderr != nil {
-		go s.writePump(conn)
+		go s.writePump(conn, doneChan)
 	}
 
-	s.wg.Wait()
+	//defer s.wsServer.Close()
+	//defer s.wsClient.Close()
 
-	go s.httpServer.Shutdown(context.Background())
+	t.Log("Waiting for wait group do be done")
+	s.wg.Wait()
+	t.Log("Waiting  done")
 
 	if s.streamOptions.Stdin != nil && !s.stdinPassed {
+		t.Log("Stdin not passed")
 		t.Fail()
 	}
 
 	if s.streamOptions.Stdout != nil && !s.stdoutPassed {
+		t.Log("Stdout not passed")
 		t.Fail()
 	}
 
 	if s.streamOptions.Stderr != nil && !s.stderrPassed {
+		t.Log("Stderr not passed")
 		t.Fail()
 	}
+
+	t.Log("Ending test")
+
 }
 
 func (s *testServer) wsBinary(w http.ResponseWriter, r *http.Request) {
-	s.t.Log("in handler")
 
 	ws, err := upgrader.Upgrade(w, r, nil)
-
+	s.wsServer = ws
 	if err != nil {
 		panic(err)
 	}
@@ -137,17 +177,26 @@ func (s *testServer) wsBinary(w http.ResponseWriter, r *http.Request) {
 		ws.WriteMessage(websocket.BinaryMessage, data)
 	}
 
-	//go s.httpServer.Shutdown(context.Background())
+	//emptyMessage := make([]byte, 0)
+	//ws.WriteMessage(WebSocketExitStream, emptyMessage)
+
 }
 
-func (s *testServer) writePump(ws *websocket.Conn) {
-	//w.Write("here3\n")
-	//defer ws.Close()
-	//ws.SetReadLimit(maxMessageSize)
-	//ws.SetReadDeadline(time.Now().Add(pongWait))
-	//ws.SetPongHandler(func(string) error { ws.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+func (s *testServer) writePump(ws *websocket.Conn, done chan struct{}) {
+
+	s.t.Log("Starting new writePump")
+
+	numMsgsWait := 0
+	if s.streamOptions.Stdout != nil {
+		numMsgsWait++
+	}
+
+	if s.streamOptions.Stderr != nil {
+		numMsgsWait++
+	}
+
 	for {
-		//fmt.Println("waiting message")
+
 		messageType, message, err := ws.ReadMessage()
 
 		if messageType > 0 {
@@ -158,12 +207,21 @@ func (s *testServer) writePump(ws *websocket.Conn) {
 					if mesageAsString == stdOutTestData {
 						s.stdoutPassed = true
 						s.t.Log("Validated Standard Out")
+
 					} else {
 						s.t.Log("Invalid std out message '" + mesageAsString + "'")
 						s.t.Fail()
 					}
 
 					s.wg.Done()
+
+					s.t.Logf("Num messages %d", numMsgsWait)
+
+					numMsgsWait--
+					if numMsgsWait == 0 {
+						s.t.Log("Exiting Read")
+						return
+					}
 
 				} else if message[0] == StreamStdErr {
 					//on the standard out stream, make sure the message matches
@@ -178,6 +236,13 @@ func (s *testServer) writePump(ws *websocket.Conn) {
 
 					s.wg.Done()
 
+					s.t.Logf("Num messages %d", numMsgsWait)
+
+					numMsgsWait--
+					if numMsgsWait == 0 {
+						s.t.Log("Exiting Read")
+						return
+					}
 				} else {
 					s.t.Log("Unknown Steam : ")
 				}
@@ -188,27 +253,33 @@ func (s *testServer) writePump(ws *websocket.Conn) {
 		}
 
 		if err != nil {
-			panic(err)
-			break
+			websocketErr, ok := err.(*websocket.CloseError)
+			if ok {
+				if websocketErr.Code == WebSocketExitStream {
+					return
+				} else {
+					panic(err)
+				}
+			} else {
+				//panic(err)
+				return
+			}
 		}
-		/*message = append(message, '\n')
-		if _, err := w.Write(message); err != nil {
-			break
-		}*/
+
 	}
+
 }
 
 func (s *testServer) readPump(conn *websocket.Conn) {
 	defer func() {
 		s.wg.Done()
-		//conn.Close()
+
 	}()
 	s.wg.Add(1)
 	conn.SetReadLimit(maxMessageSize)
 	conn.SetReadDeadline(time.Now().Add(pongWait))
 	conn.SetPongHandler(func(string) error { conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
 	for {
-		fmt.Println("waiting for input")
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
@@ -230,10 +301,9 @@ func (s *testServer) readPump(conn *websocket.Conn) {
 			s.t.FailNow()
 		}
 
+		s.t.Log("Std in passed")
 		s.stdinPassed = true
-
-		s.t.Log(messageAsString)
 		break
-		//c.hub.broadcast <- message
+
 	}
 }

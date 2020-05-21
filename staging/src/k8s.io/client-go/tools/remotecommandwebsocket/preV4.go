@@ -26,6 +26,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/klog"
 )
 
@@ -198,7 +199,7 @@ func (p *preV4Protocol) pushToWebSocket(conn *websocket.Conn, doneChan chan stru
 }
 
 func (p *preV4Protocol) pullFromWebSocket(conn *websocket.Conn, doneChan chan struct{}) {
-
+	defer runtime.HandleCrash()
 	conn.SetReadLimit(maxMessageSize)
 	conn.SetReadDeadline(time.Now().Add(pongWait))
 	conn.SetPongHandler(func(string) error { conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
@@ -209,37 +210,41 @@ func (p *preV4Protocol) pullFromWebSocket(conn *websocket.Conn, doneChan chan st
 		if messageType > 0 {
 
 			if p.binary {
-				switch message[0] {
-				case StreamStdOut:
+				if len(message) > 0 {
+					switch message[0] {
+					case StreamStdOut:
 
-					if _, err := p.remoteStdoutOut.Write(message[1:]); err != nil {
-						panic(err)
-					}
-				case StreamStdErr:
-					if _, err := p.remoteStderrOut.Write(message[1:]); err != nil {
-						panic(err)
-					}
-				case StreamErr:
-					if _, err := p.errorStreamOut.Write(message[1:]); err != nil {
-						panic(err)
+						if _, err := p.remoteStdoutOut.Write(message[1:]); err != nil {
+							runtime.HandleError(err)
+						}
+					case StreamStdErr:
+						if _, err := p.remoteStderrOut.Write(message[1:]); err != nil {
+							runtime.HandleError(err)
+						}
+					case StreamErr:
+						if _, err := p.errorStreamOut.Write(message[1:]); err != nil {
+							runtime.HandleError(err)
+						}
 					}
 				}
 			} else {
-				base64.StdEncoding.Decode(buffer, message[1:])
-				switch message[0] {
-				case Base64StreamStdOut:
+				if len(message) > 0 {
+					base64.StdEncoding.Decode(buffer, message[1:])
+					switch message[0] {
+					case Base64StreamStdOut:
 
-					//fmt.Println(buffer)
-					if _, err := p.remoteStdoutOut.Write(buffer); err != nil {
-						panic(err)
-					}
-				case Base64StreamStdErr:
-					if _, err := p.remoteStderrOut.Write(buffer); err != nil {
-						panic(err)
-					}
-				case Base64StreamErr:
-					if _, err := p.errorStreamOut.Write(buffer); err != nil {
-						panic(err)
+						//fmt.Println(buffer)
+						if _, err := p.remoteStdoutOut.Write(buffer); err != nil {
+							runtime.HandleError(err)
+						}
+					case Base64StreamStdErr:
+						if _, err := p.remoteStderrOut.Write(buffer); err != nil {
+							runtime.HandleError(err)
+						}
+					case Base64StreamErr:
+						if _, err := p.errorStreamOut.Write(buffer); err != nil {
+							runtime.HandleError(err)
+						}
 					}
 				}
 			}
@@ -252,10 +257,10 @@ func (p *preV4Protocol) pullFromWebSocket(conn *websocket.Conn, doneChan chan st
 				if websocketErr.Code == WebSocketExitStream {
 					doneChan <- struct{}{}
 				} else {
-					panic(err)
+					runtime.HandleError(err)
 				}
 			} else {
-				panic(err)
+				runtime.HandleError(err)
 			}
 		}
 	}
