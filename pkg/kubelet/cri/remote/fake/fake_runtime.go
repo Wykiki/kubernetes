@@ -24,7 +24,7 @@ import (
 	"google.golang.org/grpc"
 	kubeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	apitest "k8s.io/cri-api/pkg/apis/testing"
-	"k8s.io/kubernetes/pkg/kubelet/util"
+	"k8s.io/kubernetes/pkg/kubelet/cri/remote/util"
 	utilexec "k8s.io/utils/exec"
 )
 
@@ -112,7 +112,7 @@ func (f *RemoteRuntime) StopPodSandbox(ctx context.Context, req *kubeapi.StopPod
 // This call is idempotent, and must not return an error if the sandbox has
 // already been removed.
 func (f *RemoteRuntime) RemovePodSandbox(ctx context.Context, req *kubeapi.RemovePodSandboxRequest) (*kubeapi.RemovePodSandboxResponse, error) {
-	err := f.RuntimeService.RemovePodSandbox(req.PodSandboxId)
+	err := f.RuntimeService.StopPodSandbox(req.PodSandboxId)
 	if err != nil {
 		return nil, err
 	}
