@@ -2,6 +2,7 @@ package remotecommandwebsocket
 
 import (
 	"bufio"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"sync"
@@ -23,6 +24,8 @@ type testServer struct {
 	stdinPassed  bool
 	stdoutPassed bool
 	stderrPassed bool
+
+	isBinary bool
 }
 
 var upgrader = websocket.Upgrader{
@@ -52,28 +55,36 @@ func TestPreV4Binary(t *testing.T) {
 	go s.httpServer.ListenAndServe()
 
 	time.Sleep(2 * time.Second)
-
+	s.isBinary = true
 	runTestCase(t, true, true, true, s)
 	runTestCase(t, true, true, false, s)
 	runTestCase(t, true, false, true, s)
-	/*runTestCase(t, false, true, true, s)
+	runTestCase(t, false, true, true, s)
 	runTestCase(t, false, false, true, s)
 	runTestCase(t, true, false, false, s)
 	runTestCase(t, false, true, false, s)
-	runTestCase(t, false, false, false, s)*/
+	runTestCase(t, false, false, false, s)
+
+	s.isBinary = false
+	//runTestCase(t, false, true, false, s)
+	/*runTestCase(t, true, true, false, s, false)
+	runTestCase(t, true, false, true, s, false)
+	runTestCase(t, false, true, true, s, false)
+	runTestCase(t, false, false, true, s, false)
+	runTestCase(t, true, false, false, s, false)
+	runTestCase(t, false, true, false, s, false)
+	runTestCase(t, false, false, false, s, false)*/
 
 }
 
 func runTestCase(t *testing.T, runStdIn bool, runStdOut bool, runStdErr bool, s *testServer) {
 	t.Logf("Test Case - stdin : %t / stdout: %t / stederr : %t", runStdIn, runStdOut, runStdErr)
 
-	doneChan := make(chan struct{}, 2)
-
 	s.stdinPassed = false
 	s.stdoutPassed = false
 	s.stderrPassed = false
 
-	var stdinin io.Reader
+	var stdinin, stdoutin, stderrin io.Reader
 	var stdoutout, stderrout, stdinout io.Writer
 
 	if runStdIn {
@@ -81,11 +92,11 @@ func runTestCase(t *testing.T, runStdIn bool, runStdOut bool, runStdErr bool, s 
 	}
 
 	if runStdOut {
-		_, stdoutout = io.Pipe()
+		stdoutin, stdoutout = io.Pipe()
 	}
 
 	if runStdErr {
-		_, stderrout = io.Pipe()
+		stderrin, stderrout = io.Pipe()
 	}
 
 	s.streamOptions = &StreamOptions{
@@ -102,33 +113,41 @@ func runTestCase(t *testing.T, runStdIn bool, runStdOut bool, runStdErr bool, s 
 		panic(err)
 	}
 
-	streamer := newPreV4BinaryProtocol(*s.streamOptions)
+	var streamer streamProtocolHandler
+	if s.isBinary {
+		streamer = newPreV4BinaryProtocol(*s.streamOptions)
+	} else {
+		streamer = newPreV4Base64Protocol(*s.streamOptions)
+	}
 	go streamer.stream(conn)
 
 	if s.streamOptions.Stdin != nil {
-		// write to standard in
-		stdinbuf := bufio.NewWriter(stdinout)
-		_, err = stdinbuf.Write([]byte(stdinTestData))
+		go func() {
+			// write to standard in
+			stdinbuf := bufio.NewWriter(stdinout)
+			_, err = stdinbuf.Write([]byte(stdinTestData))
 
-		if err != nil {
-			panic(err)
-		}
-		err = stdinbuf.Flush()
-		if err != nil {
-			panic(err)
-		}
+			if err != nil {
+				panic(err)
+			}
+			err = stdinbuf.Flush()
+			if err != nil {
+				panic(err)
+			}
+		}()
 	}
 
-	if s.streamOptions.Stdout != nil || s.streamOptions.Stderr != nil {
-		go s.writePump(conn, doneChan)
+	if s.streamOptions.Stdout != nil {
+		s.wg.Add(1)
+		go s.readFromStdOut(stdoutin)
 	}
 
-	//defer s.wsServer.Close()
-	//defer s.wsClient.Close()
+	if s.streamOptions.Stderr != nil {
+		s.wg.Add(1)
+		go s.readFromStdErr(stderrin)
+	}
 
-	t.Log("Waiting for wait group do be done")
 	s.wg.Wait()
-	t.Log("Waiting  done")
 
 	if s.streamOptions.Stdin != nil && !s.stdinPassed {
 		t.Log("Stdin not passed")
@@ -145,8 +164,6 @@ func runTestCase(t *testing.T, runStdIn bool, runStdOut bool, runStdErr bool, s 
 		t.Fail()
 	}
 
-	t.Log("Ending test")
-
 }
 
 func (s *testServer) wsBinary(w http.ResponseWriter, r *http.Request) {
@@ -157,117 +174,90 @@ func (s *testServer) wsBinary(w http.ResponseWriter, r *http.Request) {
 		panic(err)
 	}
 
-	if s.streamOptions.Stdin != nil {
-		go s.readPump(ws)
-	}
-
 	if s.streamOptions.Stdout != nil {
-		s.wg.Add(1)
 		var data []byte
 		data = append(data, StreamStdOut)
 		data = append(data, []byte(stdOutTestData)...)
+
+		if !s.isBinary {
+			enc := base64.StdEncoding.EncodeToString(data)
+			data = []byte(enc)
+		}
+
 		ws.WriteMessage(websocket.BinaryMessage, data)
 	}
 
 	if s.streamOptions.Stderr != nil {
-		s.wg.Add(1)
 		var data []byte
 		data = append(data, StreamStdErr)
 		data = append(data, []byte(stdErrTestData)...)
+
+		if !s.isBinary {
+			enc := base64.StdEncoding.EncodeToString(data)
+			data = []byte(enc)
+		}
+
 		ws.WriteMessage(websocket.BinaryMessage, data)
 	}
 
-	//emptyMessage := make([]byte, 0)
-	//ws.WriteMessage(WebSocketExitStream, emptyMessage)
+	if s.streamOptions.Stdin != nil {
+		s.readPump(ws)
+	}
 
 }
 
-func (s *testServer) writePump(ws *websocket.Conn, done chan struct{}) {
+func (s *testServer) readFromStdOut(reader io.Reader) {
 
-	s.t.Log("Starting new writePump")
+	buffer := make([]byte, 1024)
+	numBytes, err := reader.Read(buffer)
+	if err != nil {
+		panic(err)
 
-	numMsgsWait := 0
-	if s.streamOptions.Stdout != nil {
-		numMsgsWait++
 	}
 
-	if s.streamOptions.Stderr != nil {
-		numMsgsWait++
-	}
+	var messageAsString string
 
-	for {
-
-		messageType, message, err := ws.ReadMessage()
-
-		if messageType > 0 {
-			if len(message) > 0 {
-				if message[0] == StreamStdOut {
-					//on the standard out stream, make sure the message matches
-					mesageAsString := string(message[1:])
-					if mesageAsString == stdOutTestData {
-						s.stdoutPassed = true
-						s.t.Log("Validated Standard Out")
-
-					} else {
-						s.t.Log("Invalid std out message '" + mesageAsString + "'")
-						s.t.Fail()
-					}
-
-					s.wg.Done()
-
-					s.t.Logf("Num messages %d", numMsgsWait)
-
-					numMsgsWait--
-					if numMsgsWait == 0 {
-						s.t.Log("Exiting Read")
-						return
-					}
-
-				} else if message[0] == StreamStdErr {
-					//on the standard out stream, make sure the message matches
-					mesageAsString := string(message[1:])
-					if mesageAsString == stdErrTestData {
-						s.stderrPassed = true
-						s.t.Log("Validated Standard Err")
-					} else {
-						s.t.Log("Invalid std err message '" + mesageAsString + "'")
-						s.t.Fail()
-					}
-
-					s.wg.Done()
-
-					s.t.Logf("Num messages %d", numMsgsWait)
-
-					numMsgsWait--
-					if numMsgsWait == 0 {
-						s.t.Log("Exiting Read")
-						return
-					}
-				} else {
-					s.t.Log("Unknown Steam : ")
-				}
-			} else {
-				s.t.Log("Empty message")
-			}
-
-		}
-
+	if !s.isBinary {
+		buffer, err = base64.StdEncoding.DecodeString(string(buffer[0:numBytes]))
 		if err != nil {
-			websocketErr, ok := err.(*websocket.CloseError)
-			if ok {
-				if websocketErr.Code == WebSocketExitStream {
-					return
-				} else {
-					panic(err)
-				}
-			} else {
-				//panic(err)
-				return
-			}
+			panic(err)
 		}
+
+		messageAsString = string(buffer[1:])
+	} else {
+		messageAsString = string(buffer[0:numBytes])
+	}
+
+	if messageAsString == stdOutTestData {
+		s.t.Log("stdout success")
+		s.stdoutPassed = true
+	} else {
+		s.t.Log("stdout failed")
+	}
+
+	s.wg.Done()
+
+}
+
+func (s *testServer) readFromStdErr(reader io.Reader) {
+
+	defer s.wg.Done()
+
+	buffer := make([]byte, 1024)
+	numBytes, err := reader.Read(buffer)
+	if err != nil {
+		panic(err)
 
 	}
 
+	messageAsString := string(buffer[0:numBytes])
+
+	if messageAsString == stdErrTestData {
+		s.t.Log("stderr success")
+		s.stderrPassed = true
+	} else {
+		s.t.Log("stderr failed")
+	}
 }
 
 func (s *testServer) readPump(conn *websocket.Conn) {
