@@ -66,14 +66,14 @@ func TestPreV4Binary(t *testing.T) {
 	runTestCase(t, false, false, false, s)
 
 	s.isBinary = false
-	//runTestCase(t, false, true, false, s)
-	/*runTestCase(t, true, true, false, s, false)
-	runTestCase(t, true, false, true, s, false)
-	runTestCase(t, false, true, true, s, false)
-	runTestCase(t, false, false, true, s, false)
-	runTestCase(t, true, false, false, s, false)
-	runTestCase(t, false, true, false, s, false)
-	runTestCase(t, false, false, false, s, false)*/
+	runTestCase(t, true, true, true, s)
+	runTestCase(t, true, true, false, s)
+	runTestCase(t, true, false, true, s)
+	runTestCase(t, false, true, true, s)
+	runTestCase(t, false, false, true, s)
+	runTestCase(t, true, false, false, s)
+	runTestCase(t, false, true, false, s)
+	runTestCase(t, false, false, false, s)
 
 }
 
@@ -181,7 +181,7 @@ func (s *testServer) wsBinary(w http.ResponseWriter, r *http.Request) {
 
 		if !s.isBinary {
 			enc := base64.StdEncoding.EncodeToString(data)
-			data = []byte(enc)
+			data = append([]byte{'1'}, []byte(enc)...)
 		}
 
 		ws.WriteMessage(websocket.BinaryMessage, data)
@@ -194,7 +194,7 @@ func (s *testServer) wsBinary(w http.ResponseWriter, r *http.Request) {
 
 		if !s.isBinary {
 			enc := base64.StdEncoding.EncodeToString(data)
-			data = []byte(enc)
+			data = append([]byte{'2'}, []byte(enc)...)
 		}
 
 		ws.WriteMessage(websocket.BinaryMessage, data)
@@ -217,16 +217,16 @@ func (s *testServer) readFromStdOut(reader io.Reader) {
 
 	var messageAsString string
 
-	if !s.isBinary {
+	/*if !s.isBinary {
 		buffer, err = base64.StdEncoding.DecodeString(string(buffer[0:numBytes]))
 		if err != nil {
 			panic(err)
 		}
 
 		messageAsString = string(buffer[1:])
-	} else {
-		messageAsString = string(buffer[0:numBytes])
-	}
+	} else {*/
+	messageAsString = string(buffer[0:numBytes])
+	//}
 
 	if messageAsString == stdOutTestData {
 		s.t.Log("stdout success")
@@ -278,13 +278,29 @@ func (s *testServer) readPump(conn *websocket.Conn) {
 			break
 		}
 
-		// make sure the message starts with 0 (stdin)
-		if message[0] != StreamStdIn {
-			s.t.FailNow()
+		if s.isBinary {
+			// make sure the message starts with 0 (stdin)
+			if message[0] != StreamStdIn {
+				s.t.Log("Invalid channel byte")
+				s.t.FailNow()
+			}
+		} else {
+			if message[0] != Base64StreamStdIn {
+				s.t.Log("Invalid channel byte")
+				s.t.FailNow()
+			}
 		}
 
 		messageAfterStream := message[1:]
 		messageAsString := string(messageAfterStream)
+
+		if !s.isBinary {
+			decodedBytes, err := base64.StdEncoding.DecodeString(messageAsString)
+			if err != nil {
+				panic(err)
+			}
+			messageAsString = string(decodedBytes)
+		}
 
 		// check the message didn't change
 		if messageAsString != stdinTestData {

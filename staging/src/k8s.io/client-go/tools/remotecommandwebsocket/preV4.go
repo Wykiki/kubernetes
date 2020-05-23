@@ -185,9 +185,16 @@ func (p *preV4Protocol) pushToWebSocket(conn *websocket.Conn, doneChan chan stru
 			}
 		}
 
-		data := make([]byte, numberOfBytesRead+1)
-		copy(data[1:], buffer[:])
-		data[0] = StreamStdIn
+		var data []byte
+
+		if p.binary {
+			data = make([]byte, numberOfBytesRead+1)
+			copy(data[1:], buffer[:])
+			data[0] = StreamStdIn
+		} else {
+			enc := base64.StdEncoding.EncodeToString(buffer[0:numberOfBytesRead])
+			data = append([]byte{'0'}, []byte(enc)...)
+		}
 
 		err = conn.WriteMessage(websocket.BinaryMessage, data)
 		if err != nil {
@@ -229,20 +236,24 @@ func (p *preV4Protocol) pullFromWebSocket(conn *websocket.Conn, doneChan chan st
 				}
 			} else {
 				if len(message) > 0 {
-					base64.StdEncoding.Decode(buffer, message[1:])
+					numBytes, err := base64.StdEncoding.Decode(buffer, message[1:])
+					if err != nil {
+						runtime.HandleError(err)
+					}
+
 					switch message[0] {
 					case Base64StreamStdOut:
 
 						//fmt.Println(buffer)
-						if _, err := p.remoteStdoutOut.Write(buffer); err != nil {
+						if _, err := p.remoteStdoutOut.Write(buffer[1:numBytes]); err != nil {
 							runtime.HandleError(err)
 						}
 					case Base64StreamStdErr:
-						if _, err := p.remoteStderrOut.Write(buffer); err != nil {
+						if _, err := p.remoteStderrOut.Write(buffer[1:numBytes]); err != nil {
 							runtime.HandleError(err)
 						}
 					case Base64StreamErr:
-						if _, err := p.errorStreamOut.Write(buffer); err != nil {
+						if _, err := p.errorStreamOut.Write(buffer[1:numBytes]); err != nil {
 							runtime.HandleError(err)
 						}
 					}
