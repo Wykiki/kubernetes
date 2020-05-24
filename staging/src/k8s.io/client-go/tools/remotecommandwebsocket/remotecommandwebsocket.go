@@ -131,8 +131,7 @@ func NewWebSocketExecutor(config *restclient.Config, url *url.URL) (Executor, er
 func NewWebSocketExecutorForTransports(transport http.RoundTripper, upgrader websocket.Upgrader, url *url.URL) (Executor, error) {
 	return NewWebSocketExecutorForProtocols(
 		transport, upgrader, url,
-		preV4BinaryWebsocketProtocol,
-		preV4Base64WebsocketProtocol,
+		v4BinaryWebsocketProtocol,
 	)
 
 	//remotecommand.StreamProtocolV4Name,
@@ -182,10 +181,10 @@ func (e *streamExecutor) Stream(options StreamOptions) error {
 	fmt.Println(protocol)
 
 	switch protocol {
-	/*case remotecommand.StreamProtocolV4Name:
-		streamer = newStreamProtocolV4(options)
-	case remotecommand.StreamProtocolV3Name:
-		streamer = newStreamProtocolV3(options)*/
+	case v4BinaryWebsocketProtocol:
+		streamer = newBinaryV4(options)
+	case v4Base64WebsocketProtocol:
+		streamer = newBase64V4(options)
 	case preV4Base64WebsocketProtocol:
 		streamer = newPreV4Base64Protocol(options)
 	case "":

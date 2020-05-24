@@ -217,16 +217,7 @@ func (s *testServer) readFromStdOut(reader io.Reader) {
 
 	var messageAsString string
 
-	/*if !s.isBinary {
-		buffer, err = base64.StdEncoding.DecodeString(string(buffer[0:numBytes]))
-		if err != nil {
-			panic(err)
-		}
-
-		messageAsString = string(buffer[1:])
-	} else {*/
 	messageAsString = string(buffer[0:numBytes])
-	//}
 
 	if messageAsString == stdOutTestData {
 		s.t.Log("stdout success")

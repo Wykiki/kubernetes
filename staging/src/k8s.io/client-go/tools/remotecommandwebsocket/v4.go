@@ -18,14 +18,20 @@ package remotecommandwebsocket
 
 import (
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/remotecommand"
 	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/util/exec"
 )
 
 // streamProtocolV4 implements version 4 of the streaming protocol for attach
@@ -176,6 +182,8 @@ func (p *streamProtocolV4) stream(conn *websocket.Conn) error {
 
 	errorChan := watchErrorStream(p.errorStreamIn, &errorDecoderV4{})
 
+	p.handleResizes()
+
 	p.copyStdin()
 
 	var wg sync.WaitGroup
@@ -184,29 +192,94 @@ func (p *streamProtocolV4) stream(conn *websocket.Conn) error {
 
 	//start streaming to the api server
 	p.pullFromWebSocket(conn, &wg)
-	p.pushToWebSocket(conn, &wg)
+
+	//stream standard in
+	p.pushToWebSocket(conn, &wg, p.Stdin, StreamStdIn, Base64StreamStdIn)
+
+	//stream the resize stream
+
+	if p.Tty {
+		p.pushToWebSocket(conn, &wg, pipeReaderWrapper{reader: p.resizeTerminalIn}, StreamResize, Base64StreamResize)
+	}
+
 	//p.ping(conn, doneChan)
 
 	// we're waiting for stdout/stderr to finish copying
 	wg.Wait()
 
 	// waits for errorStream to finish reading with an error or nil
-
+	p.errorStreamOut.Close()
 	// notify the ping function to stop
 	doneChan <- struct{}{}
 
 	return <-errorChan
 }
 
-// errorDecoderV4 interprets the error channel data as plain text.
+func (p *streamProtocolV4) handleResizes() {
+	if p.resizeTerminalOut == nil || p.TerminalSizeQueue == nil {
+		return
+	}
+	go func() {
+		defer runtime.HandleCrash()
+
+		encoder := json.NewEncoder(p.resizeTerminalOut)
+		for {
+			size := p.TerminalSizeQueue.Next()
+			if size == nil {
+				return
+			}
+			if err := encoder.Encode(&size); err != nil {
+				runtime.HandleError(err)
+			}
+		}
+	}()
+}
+
+// errorDecoderV4 interprets the json-marshaled metav1.Status on the error channel
+// and creates an exec.ExitError from it.
 type errorDecoderV4 struct{}
 
 func (d *errorDecoderV4) decode(message []byte) error {
-	return fmt.Errorf("error executing remote command: %s", message)
+	status := metav1.Status{}
+	err := json.Unmarshal(message, &status)
+	if err != nil {
+		return fmt.Errorf("error stream protocol error: %v in %q", err, string(message))
+	}
+	switch status.Status {
+	case metav1.StatusSuccess:
+		return nil
+	case metav1.StatusFailure:
+		if status.Reason == remotecommand.NonZeroExitCodeReason {
+			if status.Details == nil {
+				return errors.New("error stream protocol error: details must be set")
+			}
+			for i := range status.Details.Causes {
+				c := &status.Details.Causes[i]
+				if c.Type != remotecommand.ExitCodeCauseType {
+					continue
+				}
+
+				rc, err := strconv.ParseUint(c.Message, 10, 8)
+				if err != nil {
+					return fmt.Errorf("error stream protocol error: invalid exit code value %q", c.Message)
+				}
+				return exec.CodeExitError{
+					Err:  fmt.Errorf("command terminated with exit code %d", rc),
+					Code: int(rc),
+				}
+			}
+
+			return fmt.Errorf("error stream protocol error: no %s cause given", remotecommand.ExitCodeCauseType)
+		}
+	default:
+		return errors.New("error stream protocol error: unknown error")
+	}
+
+	return fmt.Errorf(status.Message)
 }
 
-func (p *streamProtocolV4) pushToWebSocket(conn *websocket.Conn, wg *sync.WaitGroup) {
-	if p.Stdin == nil {
+func (p *streamProtocolV4) pushToWebSocket(conn *websocket.Conn, wg *sync.WaitGroup, in io.Reader, binaryChannelID byte, base64ChannelID byte) {
+	if in == nil {
 		return
 	}
 	wg.Add(1)
@@ -219,7 +292,7 @@ func (p *streamProtocolV4) pushToWebSocket(conn *websocket.Conn, wg *sync.WaitGr
 
 		for {
 
-			numberOfBytesRead, err := p.StreamOptions.Stdin.Read(buffer)
+			numberOfBytesRead, err := in.Read(buffer)
 			if err != nil {
 				if err == io.EOF {
 					return
@@ -233,10 +306,10 @@ func (p *streamProtocolV4) pushToWebSocket(conn *websocket.Conn, wg *sync.WaitGr
 			if p.binary {
 				data = make([]byte, numberOfBytesRead+1)
 				copy(data[1:], buffer[:])
-				data[0] = StreamStdIn
+				data[0] = binaryChannelID
 			} else {
 				enc := base64.StdEncoding.EncodeToString(buffer[0:numberOfBytesRead])
-				data = append([]byte{'0'}, []byte(enc)...)
+				data = append([]byte{base64ChannelID}, []byte(enc)...)
 			}
 
 			err = conn.WriteMessage(websocket.BinaryMessage, data)
