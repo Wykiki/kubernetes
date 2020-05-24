@@ -17,6 +17,7 @@ limitations under the License.
 package remotecommandwebsocket
 
 import (
+	"encoding/base64"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -45,13 +46,24 @@ type streamProtocolV4 struct {
 
 	remoteStderrIn  *io.PipeReader
 	remoteStderrOut *io.PipeWriter
+
+	resizeTerminalIn  *io.PipeReader
+	resizeTerminalOut *io.PipeWriter
 }
 
 var _ streamProtocolHandler = &streamProtocolV4{}
 
-func newBinarylV4(options StreamOptions) streamProtocolHandler {
+func newBinaryV4(options StreamOptions) streamProtocolHandler {
 	return &streamProtocolV4{
 		StreamOptions: options,
+		binary:        true,
+	}
+}
+
+func newBase64V4(options StreamOptions) streamProtocolHandler {
+	return &streamProtocolV4{
+		StreamOptions: options,
+		binary:        false,
 	}
 }
 
@@ -155,9 +167,14 @@ func (p *streamProtocolV4) stream(conn *websocket.Conn) error {
 		p.remoteStderrIn, p.remoteStderrOut = io.Pipe()
 	}
 
+	// set up resize stream
+	if p.Tty {
+		p.resizeTerminalIn, p.resizeTerminalOut = io.Pipe()
+	}
+
 	// now that all the streams have been created, proceed with reading & copying
 
-	errorChan := watchErrorStream(p.errorStreamIn, &errorDecoderV2{})
+	errorChan := watchErrorStream(p.errorStreamIn, &errorDecoderV4{})
 
 	p.copyStdin()
 
@@ -211,10 +228,21 @@ func (p *streamProtocolV4) pushToWebSocket(conn *websocket.Conn, wg *sync.WaitGr
 				}
 			}
 
-			data := make([]byte, numberOfBytesRead+1)
-			copy(data[1:], buffer[:])
-			data[0] = StreamStdIn
-			p.remoteStdinOut.Write(data)
+			var data []byte
+
+			if p.binary {
+				data = make([]byte, numberOfBytesRead+1)
+				copy(data[1:], buffer[:])
+				data[0] = StreamStdIn
+			} else {
+				enc := base64.StdEncoding.EncodeToString(buffer[0:numberOfBytesRead])
+				data = append([]byte{'0'}, []byte(enc)...)
+			}
+
+			err = conn.WriteMessage(websocket.BinaryMessage, data)
+			if err != nil {
+				runtime.HandleError(err)
+			}
 
 		}
 	}()
@@ -230,24 +258,53 @@ func (p *streamProtocolV4) pullFromWebSocket(conn *websocket.Conn, wg *sync.Wait
 		conn.SetReadLimit(maxMessageSize)
 		conn.SetReadDeadline(time.Now().Add(pongWait))
 		conn.SetPongHandler(func(string) error { conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+		buffer := make([]byte, 1024)
 		for {
 			messageType, message, err := conn.ReadMessage()
 
 			if messageType > 0 {
 
-				switch message[0] {
-				case StreamStdOut:
+				if p.binary {
+					if len(message) > 0 {
+						switch message[0] {
+						case StreamStdOut:
 
-					if _, err := p.remoteStdoutOut.Write(message[1:]); err != nil {
-						runtime.HandleError(err)
+							if _, err := p.remoteStdoutOut.Write(message[1:]); err != nil {
+								runtime.HandleError(err)
+							}
+						case StreamStdErr:
+							if _, err := p.remoteStderrOut.Write(message[1:]); err != nil {
+								runtime.HandleError(err)
+							}
+						case StreamErr:
+							if _, err := p.errorStreamOut.Write(message[1:]); err != nil {
+								runtime.HandleError(err)
+							}
+						}
 					}
-				case StreamStdErr:
-					if _, err := p.remoteStderrOut.Write(message[1:]); err != nil {
-						runtime.HandleError(err)
-					}
-				case StreamErr:
-					if _, err := p.errorStreamOut.Write(message[1:]); err != nil {
-						runtime.HandleError(err)
+				} else {
+					if len(message) > 0 {
+						numBytes, err := base64.StdEncoding.Decode(buffer, message[1:])
+						if err != nil {
+							runtime.HandleError(err)
+						}
+
+						switch message[0] {
+						case Base64StreamStdOut:
+
+							//fmt.Println(buffer)
+							if _, err := p.remoteStdoutOut.Write(buffer[1:numBytes]); err != nil {
+								runtime.HandleError(err)
+							}
+						case Base64StreamStdErr:
+							if _, err := p.remoteStderrOut.Write(buffer[1:numBytes]); err != nil {
+								runtime.HandleError(err)
+							}
+						case Base64StreamErr:
+							if _, err := p.errorStreamOut.Write(buffer[1:numBytes]); err != nil {
+								runtime.HandleError(err)
+							}
+						}
 					}
 				}
 
@@ -262,7 +319,7 @@ func (p *streamProtocolV4) pullFromWebSocket(conn *websocket.Conn, wg *sync.Wait
 						runtime.HandleError(err)
 					}
 				} else {
-					panic(err)
+					runtime.HandleError(err)
 				}
 			}
 		}
