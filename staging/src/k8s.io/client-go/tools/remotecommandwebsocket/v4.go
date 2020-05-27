@@ -127,6 +127,7 @@ func (p *streamProtocolV4) copyStdout(wg *sync.WaitGroup) {
 	go func() {
 		defer runtime.HandleCrash()
 		defer wg.Done()
+		defer p.closeStreams()
 
 		if _, err := io.Copy(p.Stdout, p.remoteStdoutIn); err != nil {
 			runtime.HandleError(err)
@@ -143,6 +144,7 @@ func (p *streamProtocolV4) copyStderr(wg *sync.WaitGroup) {
 	go func() {
 		defer runtime.HandleCrash()
 		defer wg.Done()
+		defer p.closeStreams()
 
 		if _, err := io.Copy(p.Stderr, p.remoteStderrIn); err != nil {
 			runtime.HandleError(err)
@@ -208,11 +210,43 @@ func (p *streamProtocolV4) stream(conn *websocket.Conn) error {
 	wg.Wait()
 
 	// waits for errorStream to finish reading with an error or nil
-	p.errorStreamOut.Close()
+
 	// notify the ping function to stop
 	doneChan <- struct{}{}
 
 	return <-errorChan
+}
+
+func (p *streamProtocolV4) closeStreams() {
+
+	//close out the pipes
+
+	p.errorStreamIn.CloseWithError(nil)
+	p.errorStreamOut.CloseWithError(nil)
+
+	if p.remoteStderrIn != nil {
+		p.remoteStderrIn.CloseWithError(nil)
+		p.remoteStderrOut.CloseWithError(nil)
+
+	}
+
+	if p.remoteStdinIn != nil {
+		p.remoteStdinIn.CloseWithError(nil)
+		p.remoteStdinOut.CloseWithError(nil)
+
+	}
+
+	if p.remoteStdoutIn != nil {
+		p.remoteStdoutIn.CloseWithError(nil)
+		p.remoteStdoutOut.CloseWithError(nil)
+
+	}
+
+	if p.resizeTerminalIn != nil {
+		p.resizeTerminalIn.CloseWithError(nil)
+		p.resizeTerminalOut.CloseWithError(nil)
+
+	}
 }
 
 func (p *streamProtocolV4) handleResizes() {
@@ -287,6 +321,7 @@ func (p *streamProtocolV4) pushToWebSocket(conn *websocket.Conn, wg *sync.WaitGr
 	go func() {
 		defer runtime.HandleCrash()
 		defer wg.Done()
+		defer p.closeStreams()
 
 		buffer := make([]byte, 1024)
 
@@ -328,6 +363,7 @@ func (p *streamProtocolV4) pullFromWebSocket(conn *websocket.Conn, wg *sync.Wait
 	go func() {
 		defer runtime.HandleCrash()
 		defer wg.Done()
+		defer p.closeStreams()
 		conn.SetReadLimit(maxMessageSize)
 		conn.SetReadDeadline(time.Now().Add(pongWait))
 		conn.SetPongHandler(func(string) error { conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
