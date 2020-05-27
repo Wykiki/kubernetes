@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -130,7 +131,9 @@ func (p *streamProtocolV4) copyStdout(wg *sync.WaitGroup) {
 		defer p.closeStreams()
 
 		if _, err := io.Copy(p.Stdout, p.remoteStdoutIn); err != nil {
-			runtime.HandleError(err)
+			if err != io.EOF {
+				runtime.HandleError(err)
+			}
 		}
 	}()
 }
@@ -221,29 +224,29 @@ func (p *streamProtocolV4) closeStreams() {
 
 	//close out the pipes
 
-	p.errorStreamIn.CloseWithError(nil)
+	//p.errorStreamIn.CloseWithError(nil)
 	p.errorStreamOut.CloseWithError(nil)
 
 	if p.remoteStderrIn != nil {
-		p.remoteStderrIn.CloseWithError(nil)
+		//p.remoteStderrIn.CloseWithError(nil)
 		p.remoteStderrOut.CloseWithError(nil)
 
 	}
 
 	if p.remoteStdinIn != nil {
-		p.remoteStdinIn.CloseWithError(nil)
+		//p.remoteStdinIn.CloseWithError(nil)
 		p.remoteStdinOut.CloseWithError(nil)
 
 	}
 
 	if p.remoteStdoutIn != nil {
-		p.remoteStdoutIn.CloseWithError(nil)
+		//p.remoteStdoutIn.CloseWithError(nil)
 		p.remoteStdoutOut.CloseWithError(nil)
 
 	}
 
 	if p.resizeTerminalIn != nil {
-		p.resizeTerminalIn.CloseWithError(nil)
+		//p.resizeTerminalIn.CloseWithError(nil)
 		p.resizeTerminalOut.CloseWithError(nil)
 
 	}
@@ -422,11 +425,14 @@ func (p *streamProtocolV4) pullFromWebSocket(conn *websocket.Conn, wg *sync.Wait
 			if err != nil {
 				websocketErr, ok := err.(*websocket.CloseError)
 				if ok {
-					if websocketErr.Code == WebSocketExitStream {
+					if websocket.IsUnexpectedCloseError(websocketErr, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, 1006) {
 						return
-					} else {
-						runtime.HandleError(err)
 					}
+
+					debug.PrintStack()
+
+					runtime.HandleError(err)
+
 				} else {
 					runtime.HandleError(err)
 				}
