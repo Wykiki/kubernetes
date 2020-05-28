@@ -30,7 +30,7 @@ import (
 	restclient "k8s.io/client-go/rest"
 	remotecommandspdy "k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/transport/websocket"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -118,6 +118,13 @@ type streamProtocolHandler interface {
 // NewWebSocketExecutor creates a new websocket connection to the URL specified with
 // the rest client's TLS configuration and headers
 func NewWebSocketExecutor(config *restclient.Config, url *url.URL) (Executor, error) {
+
+	if url.Scheme == "https" {
+		url.Scheme = "wss"
+	} else if url.Scheme == "http" {
+		url.Scheme = "ws"
+	}
+
 	wrapper, upgradeRoundTripper, err := websocket.RoundTripperFor(config)
 	if err != nil {
 		return nil, err
@@ -131,7 +138,7 @@ func NewWebSocketExecutor(config *restclient.Config, url *url.URL) (Executor, er
 func NewWebSocketExecutorForTransports(transport http.RoundTripper, upgrader websocket.Upgrader, url *url.URL) (Executor, error) {
 	return NewWebSocketExecutorForProtocols(
 		transport, upgrader, url,
-		v4BinaryWebsocketProtocol,
+		preV4BinaryWebsocketProtocol,
 	)
 
 	//remotecommand.StreamProtocolV4Name,
