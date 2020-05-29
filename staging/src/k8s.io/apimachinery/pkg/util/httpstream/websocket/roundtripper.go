@@ -20,7 +20,6 @@ import (
 	"crypto/tls"
 	"net/http"
 	"net/url"
-	"time"
 
 	"github.com/gorilla/websocket"
 	"k8s.io/apimachinery/pkg/util/httpstream"
@@ -41,33 +40,6 @@ type RoundTripper struct {
 	// proxier knows which proxy to use given a request, defaults to http.ProxyFromEnvironment
 	// Used primarily for mocking the proxy discovery in tests.
 	proxier func(req *http.Request) (*url.URL, error)
-}
-
-// Connection holds the underlying websocket connection
-type Connection struct {
-	httpstream.Connection
-	Conn *websocket.Conn
-}
-
-// CreateStream does nothing as httpstream.Stream is a SPDY function, not a websocket concept
-func (connection *Connection) CreateStream(headers http.Header) (httpstream.Stream, error) {
-	return nil, nil
-}
-
-// Close does nothing as httpstream.Stream is a SPDY function, not a websocket concept
-func (connection *Connection) Close() error {
-	return nil
-}
-
-// CloseChan does nothing as httpstream.Stream is a SPDY function, not a websocket concept
-func (connection *Connection) CloseChan() <-chan bool {
-	out := make(chan bool)
-	return out
-}
-
-// SetIdleTimeout does nothing as httpstream.Stream is a SPDY function, not a websocket concept
-func (connection *Connection) SetIdleTimeout(timeout time.Duration) {
-
 }
 
 // NewRoundTripper initializes the RoundTripper
