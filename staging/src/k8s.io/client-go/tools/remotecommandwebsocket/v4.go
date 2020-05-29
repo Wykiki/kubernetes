@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -79,7 +78,7 @@ func (p *streamProtocolV4) copyStdin() {
 		var once sync.Once
 
 		// copy from client's stdin to container's stdin
-		go func() {
+		/*go func() {
 			defer runtime.HandleCrash()
 
 			// if p.stdin is noninteractive, p.g. `echo abc | kubectl exec -i <pod> -- cat`, make sure
@@ -90,7 +89,7 @@ func (p *streamProtocolV4) copyStdin() {
 			if _, err := io.Copy(p.remoteStdinOut, readerWrapper{p.Stdin}); err != nil {
 				runtime.HandleError(err)
 			}
-		}()
+		}()*/
 
 		// read from remoteStdin until the stream is closed. this is essential to
 		// be able to exit interactive sessions cleanly and not leak goroutines or
@@ -113,6 +112,7 @@ func (p *streamProtocolV4) copyStdin() {
 			// this "copy" doesn't actually read anything - it's just here to wait for
 			// the server to close remoteStdin.
 			if _, err := io.Copy(ioutil.Discard, p.remoteStdinIn); err != nil {
+				p.closeStreams()
 				runtime.HandleError(err)
 			}
 		}()
@@ -187,13 +187,7 @@ func (p *streamProtocolV4) stream(conn *websocket.Conn) error {
 
 	errorChan := watchErrorStream(p.errorStreamIn, &errorDecoderV4{})
 
-	p.handleResizes()
-
-	p.copyStdin()
-
 	var wg sync.WaitGroup
-	p.copyStdout(&wg)
-	p.copyStderr(&wg)
 
 	//start streaming to the api server
 	p.pullFromWebSocket(conn, &wg)
@@ -207,6 +201,12 @@ func (p *streamProtocolV4) stream(conn *websocket.Conn) error {
 		p.pushToWebSocket(conn, &wg, pipeReaderWrapper{reader: p.resizeTerminalIn}, StreamResize, Base64StreamResize)
 	}
 
+	p.copyStdout(&wg)
+	p.copyStderr(&wg)
+
+	p.handleResizes()
+
+	p.copyStdin()
 	//p.ping(conn, doneChan)
 
 	// we're waiting for stdout/stderr to finish copying
@@ -250,6 +250,7 @@ func (p *streamProtocolV4) closeStreams() {
 		p.resizeTerminalOut.CloseWithError(nil)
 
 	}
+
 }
 
 func (p *streamProtocolV4) handleResizes() {
@@ -331,11 +332,13 @@ func (p *streamProtocolV4) pushToWebSocket(conn *websocket.Conn, wg *sync.WaitGr
 		for {
 
 			numberOfBytesRead, err := in.Read(buffer)
+
 			if err != nil {
 				if err == io.EOF {
 					return
 				} else {
 					runtime.HandleError(err)
+					return
 				}
 			}
 
@@ -343,8 +346,7 @@ func (p *streamProtocolV4) pushToWebSocket(conn *websocket.Conn, wg *sync.WaitGr
 
 			if p.binary {
 				data = make([]byte, numberOfBytesRead+1)
-				copy(data[1:], buffer[:])
-				data[0] = binaryChannelID
+				data = append([]byte{binaryChannelID}, buffer[0:numberOfBytesRead]...)
 			} else {
 				enc := base64.StdEncoding.EncodeToString(buffer[0:numberOfBytesRead])
 				data = append([]byte{base64ChannelID}, []byte(enc)...)
@@ -353,6 +355,7 @@ func (p *streamProtocolV4) pushToWebSocket(conn *websocket.Conn, wg *sync.WaitGr
 			err = conn.WriteMessage(websocket.BinaryMessage, data)
 			if err != nil {
 				runtime.HandleError(err)
+				return
 			}
 
 		}
@@ -426,16 +429,19 @@ func (p *streamProtocolV4) pullFromWebSocket(conn *websocket.Conn, wg *sync.Wait
 				websocketErr, ok := err.(*websocket.CloseError)
 				if ok {
 					if websocket.IsUnexpectedCloseError(websocketErr, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, 1006) {
+						fmt.Println("exit 1")
 						return
 					}
 
-					debug.PrintStack()
+					//debug.PrintStack()
 
 					runtime.HandleError(err)
 
 				} else {
 					runtime.HandleError(err)
 				}
+				fmt.Println("exit 2")
+				return
 			}
 		}
 	}()

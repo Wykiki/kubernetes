@@ -138,7 +138,7 @@ func NewWebSocketExecutor(config *restclient.Config, url *url.URL) (Executor, er
 func NewWebSocketExecutorForTransports(transport http.RoundTripper, upgrader websocket.Upgrader, url *url.URL) (Executor, error) {
 	return NewWebSocketExecutorForProtocols(
 		transport, upgrader, url,
-		preV4BinaryWebsocketProtocol,
+		v4BinaryWebsocketProtocol,
 	)
 
 	//remotecommand.StreamProtocolV4Name,

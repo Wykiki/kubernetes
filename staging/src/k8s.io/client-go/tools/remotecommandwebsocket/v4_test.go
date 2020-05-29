@@ -29,8 +29,8 @@ func TestV4Binary(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 	s.isBinary = true
-	runTestCasev4(t, false, true, false, s)
-	/*runTestCasev4(t, true, true, false, s)
+	runTestCasev4(t, true, true, true, s)
+	runTestCasev4(t, true, true, false, s)
 	runTestCasev4(t, true, false, true, s)
 	runTestCasev4(t, false, true, true, s)
 	runTestCasev4(t, false, false, true, s)
@@ -46,7 +46,7 @@ func TestV4Binary(t *testing.T) {
 	runTestCasev4(t, false, false, true, s)
 	runTestCasev4(t, true, false, false, s)
 	runTestCasev4(t, false, true, false, s)
-	runTestCasev4(t, false, false, false, s)*/
+	runTestCasev4(t, false, false, false, s)
 
 }
 
