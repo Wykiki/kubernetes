@@ -22,10 +22,11 @@ import (
 	"path/filepath"
 	"testing"
 
-	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	"k8s.io/kubernetes/cmd/kubeadm/app/preflight"
 	"k8s.io/utils/exec"
 	fakeexec "k8s.io/utils/exec/testing"
+
+	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
+	"k8s.io/kubernetes/cmd/kubeadm/app/preflight"
 )
 
 func assertExists(t *testing.T, path string) {
@@ -173,7 +174,7 @@ func TestConfigDirCleaner(t *testing.T) {
 			if test.resetDir == "" {
 				test.resetDir = "pki"
 			}
-			resetConfigDir(tmpDir, filepath.Join(tmpDir, test.resetDir))
+			resetConfigDir(tmpDir, filepath.Join(tmpDir, test.resetDir), false)
 
 			// Verify the files we cleanup implicitly in every test:
 			assertExists(t, tmpDir)

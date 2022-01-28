@@ -19,6 +19,10 @@ package fairqueuing
 import (
 	"context"
 	"time"
+
+	"k8s.io/apiserver/pkg/util/flowcontrol/debug"
+	"k8s.io/apiserver/pkg/util/flowcontrol/metrics"
+	"k8s.io/apiserver/pkg/util/flowcontrol/request"
 )
 
 // QueueSetFactory is used to create QueueSet objects.  Creation, like
@@ -27,8 +31,11 @@ import (
 // are separated so that errors from the first phase can be found
 // before committing to a concurrency allotment for the second.
 type QueueSetFactory interface {
-	// BeginConstruction does the first phase of creating a QueueSet
-	BeginConstruction(QueuingConfig) (QueueSetCompleter, error)
+	// BeginConstruction does the first phase of creating a QueueSet.
+	// The RatioedChangeObserverPair observes number of requests,
+	// execution covering just the regular phase.
+	// The RatioedChangeObserver observes number of seats occupied through all phases of execution.
+	BeginConstruction(QueuingConfig, metrics.RatioedChangeObserverPair, metrics.RatioedChangeObserver) (QueueSetCompleter, error)
 }
 
 // QueueSetCompleter finishes the two-step process of creating or
@@ -43,7 +50,7 @@ type QueueSetCompleter interface {
 // functionality of one non-exempt priority level.  It covers the
 // functionality described in the "Assignment to a Queue", "Queuing",
 // and "Dispatching" sections of
-// https://github.com/kubernetes/enhancements/blob/master/keps/sig-api-machinery/20190228-priority-and-fairness.md
+// https://github.com/kubernetes/enhancements/blob/master/keps/sig-api-machinery/1040-priority-and-fairness/README.md
 // .  Some day we may have connections between priority levels, but
 // today is not that day.
 type QueueSet interface {
@@ -77,8 +84,21 @@ type QueueSet interface {
 	// was idle at the moment of the return.  Otherwise idle==false
 	// and the client must call the Finish method of the Request
 	// exactly once.
-	StartRequest(ctx context.Context, hashValue uint64, fsName string, descr1, descr2 interface{}) (req Request, idle bool)
+	StartRequest(ctx context.Context, width *request.WorkEstimate, hashValue uint64, flowDistinguisher, fsName string, descr1, descr2 interface{}, queueNoteFn QueueNoteFn) (req Request, idle bool)
+
+	// UpdateObservations makes sure any time-based statistics have
+	// caught up with the current clock reading
+	UpdateObservations()
+
+	// Dump saves and returns the instant internal state of the queue-set.
+	// Note that dumping process will stop the queue-set from proceeding
+	// any requests.
+	// For debugging only.
+	Dump(includeRequestDetails bool) debug.QueueSetDump
 }
+
+// QueueNoteFn is called when a request enters and leaves a queue
+type QueueNoteFn func(inQueue bool)
 
 // Request represents the remainder of the handling of one request
 type Request interface {

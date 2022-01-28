@@ -20,16 +20,22 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 
-	"k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/klog/v2"
+
+	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	kubeletphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/kubelet"
+	patchnodephase "k8s.io/kubernetes/cmd/kubeadm/app/phases/patchnode"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/upgrade"
+	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
 	dryrunutil "k8s.io/kubernetes/cmd/kubeadm/app/util/dryrun"
 )
 
@@ -51,7 +57,6 @@ func NewKubeletConfigPhase() workflow.Phase {
 		InheritFlags: []string{
 			options.DryRun,
 			options.KubeconfigPath,
-			options.KubeletVersion,
 		},
 	}
 	return phase
@@ -66,7 +71,6 @@ func runKubeletConfigPhase() func(c workflow.RunData) error {
 
 		// otherwise, retrieve all the info required for kubelet config upgrade
 		cfg := data.Cfg()
-		client := data.Client()
 		dryRun := data.DryRun()
 
 		// Set up the kubelet directory to use. If dry-running, this will return a fake directory
@@ -75,24 +79,10 @@ func runKubeletConfigPhase() func(c workflow.RunData) error {
 			return err
 		}
 
-		// Gets the target kubelet version.
-		// by default kubelet version is expected to be equal to ClusterConfiguration.KubernetesVersion, but
-		// users can specify a different kubelet version (this is a legacy of the original implementation
-		// of `kubeam upgrade node config` which we are preserving in order to don't break GA contract)
-		kubeletVersionStr := cfg.ClusterConfiguration.KubernetesVersion
-		if data.KubeletVersion() != "" && data.KubeletVersion() != kubeletVersionStr {
-			kubeletVersionStr = data.KubeletVersion()
-			fmt.Printf("[upgrade] Using kubelet config version %s, while kubernetes-version is %s\n", kubeletVersionStr, cfg.ClusterConfiguration.KubernetesVersion)
-		}
-
-		// Parse the desired kubelet version
-		kubeletVersion, err := version.ParseSemantic(kubeletVersionStr)
-		if err != nil {
-			return err
-		}
-
 		// TODO: Checkpoint the current configuration first so that if something goes wrong it can be recovered
-		if err := kubeletphase.DownloadConfig(client, kubeletVersion, kubeletDir); err != nil {
+
+		// Store the kubelet component configuration.
+		if err = kubeletphase.WriteConfigToDisk(&cfg.ClusterConfiguration, kubeletDir); err != nil {
 			return err
 		}
 
@@ -102,6 +92,40 @@ func runKubeletConfigPhase() func(c workflow.RunData) error {
 				return errors.Wrap(err, "error printing files on dryrun")
 			}
 			return nil
+		}
+
+		// Handle a missing URL scheme in the Node CRI socket.
+		// Older versions of kubeadm tolerate CRI sockets without URL schemes (/var/run/foo without unix://).
+		// During "upgrade node" for worker nodes the cfg.NodeRegistration would be left empty.
+		// This requires to call GetNodeRegistration on demand and fetch the node name and CRI socket.
+		// If the NodeRegistration (nro) contains a socket without a URL scheme, update it.
+		//
+		// TODO: this workaround can be removed in 1.25 once all user node sockets have a URL scheme:
+		// https://github.com/kubernetes/kubeadm/issues/2426
+		var missingURLScheme bool
+		nro := &kubeadmapi.NodeRegistrationOptions{}
+		if !dryRun {
+			if err := configutil.GetNodeRegistration(data.KubeConfigPath(), data.Client(), nro); err != nil {
+				return errors.Wrap(err, "could not retrieve the node registration options for this node")
+			}
+			missingURLScheme = strings.HasPrefix(nro.CRISocket, kubeadmapiv1.DefaultContainerRuntimeURLScheme)
+		}
+		if missingURLScheme {
+			if !dryRun {
+				newSocket := kubeadmapiv1.DefaultContainerRuntimeURLScheme + "://" + nro.CRISocket
+				klog.V(2).Infof("ensuring that Node %q has a CRI socket annotation with URL scheme %q", nro.Name, newSocket)
+				if err := patchnodephase.AnnotateCRISocket(data.Client(), nro.Name, newSocket); err != nil {
+					return errors.Wrapf(err, "error updating the CRI socket for Node %q", nro.Name)
+				}
+			} else {
+				fmt.Println("[upgrade] Would update the node CRI socket path to include an URL scheme")
+			}
+		}
+
+		// TODO: Temporary workaround. Remove in 1.25:
+		// https://github.com/kubernetes/kubeadm/issues/2426
+		if err := upgrade.UpdateKubeletDynamicEnvFileWithURLScheme(dryRun); err != nil {
+			return err
 		}
 
 		fmt.Println("[upgrade] The configuration for this node was successfully updated!")

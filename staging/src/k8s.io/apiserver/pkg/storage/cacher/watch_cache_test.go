@@ -24,20 +24,20 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/apis/example"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/etcd3"
 	"k8s.io/client-go/tools/cache"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 func makeTestPod(name string, resourceVersion uint64) *v1.Pod {
@@ -67,8 +67,18 @@ func makeTestStoreElement(pod *v1.Pod) *storeElement {
 	}
 }
 
+type testWatchCache struct {
+	*watchCache
+}
+
+func (w *testWatchCache) getAllEventsSince(resourceVersion uint64) ([]*watchCacheEvent, error) {
+	w.watchCache.RLock()
+	defer w.watchCache.RUnlock()
+	return w.watchCache.GetAllEventsSinceThreadUnsafe(resourceVersion)
+}
+
 // newTestWatchCache just adds a fake clock.
-func newTestWatchCache(capacity int, indexers *cache.Indexers) *watchCache {
+func newTestWatchCache(capacity int, indexers *cache.Indexers) *testWatchCache {
 	keyFunc := func(obj runtime.Object) (string, error) {
 		return storage.NamespaceKeyFunc("prefix", obj)
 	}
@@ -81,9 +91,15 @@ func newTestWatchCache(capacity int, indexers *cache.Indexers) *watchCache {
 	}
 	versioner := etcd3.APIObjectVersioner{}
 	mockHandler := func(*watchCacheEvent) {}
-	wc := newWatchCache(capacity, keyFunc, mockHandler, getAttrsFunc, versioner, indexers, reflect.TypeOf(&example.Pod{}))
-	wc.clock = clock.NewFakeClock(time.Now())
-	return wc
+	wc := newWatchCache(keyFunc, mockHandler, getAttrsFunc, versioner, indexers, testingclock.NewFakeClock(time.Now()), reflect.TypeOf(&example.Pod{}))
+	// To preserve behavior of tests that assume a given capacity,
+	// resize it to th expected size.
+	wc.capacity = capacity
+	wc.cache = make([]*watchCacheEvent, capacity)
+	wc.lowerBoundCapacity = min(capacity, defaultLowerBoundCapacity)
+	wc.upperBoundCapacity = max(capacity, defaultUpperBoundCapacity)
+
+	return &testWatchCache{watchCache: wc}
 }
 
 func TestWatchCacheBasic(t *testing.T) {
@@ -132,7 +148,7 @@ func TestWatchCacheBasic(t *testing.T) {
 			"prefix/ns/pod2": *makeTestStoreElement(makeTestPod("pod2", 5)),
 			"prefix/ns/pod3": *makeTestStoreElement(makeTestPod("pod3", 6)),
 		}
-		items := make(map[string]storeElement, 0)
+		items := make(map[string]storeElement)
 		for _, item := range store.List() {
 			elem := item.(*storeElement)
 			items[elem.Key] = *elem
@@ -174,7 +190,7 @@ func TestEvents(t *testing.T) {
 
 	// Test for Added event.
 	{
-		_, err := store.GetAllEventsSince(1)
+		_, err := store.getAllEventsSince(1)
 		if err == nil {
 			t.Errorf("expected error too old")
 		}
@@ -183,7 +199,7 @@ func TestEvents(t *testing.T) {
 		}
 	}
 	{
-		result, err := store.GetAllEventsSince(2)
+		result, err := store.getAllEventsSince(2)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -207,13 +223,13 @@ func TestEvents(t *testing.T) {
 
 	// Test with not full cache.
 	{
-		_, err := store.GetAllEventsSince(1)
+		_, err := store.getAllEventsSince(1)
 		if err == nil {
 			t.Errorf("expected error too old")
 		}
 	}
 	{
-		result, err := store.GetAllEventsSince(3)
+		result, err := store.getAllEventsSince(3)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -241,13 +257,13 @@ func TestEvents(t *testing.T) {
 
 	// Test with full cache - there should be elements from 5 to 9.
 	{
-		_, err := store.GetAllEventsSince(3)
+		_, err := store.getAllEventsSince(3)
 		if err == nil {
 			t.Errorf("expected error too old")
 		}
 	}
 	{
-		result, err := store.GetAllEventsSince(4)
+		result, err := store.getAllEventsSince(4)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -266,7 +282,7 @@ func TestEvents(t *testing.T) {
 	store.Delete(makeTestPod("pod", uint64(10)))
 
 	{
-		result, err := store.GetAllEventsSince(9)
+		result, err := store.getAllEventsSince(9)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -296,13 +312,13 @@ func TestMarker(t *testing.T) {
 		makeTestPod("pod2", 9),
 	}, "9")
 
-	_, err := store.GetAllEventsSince(8)
+	_, err := store.getAllEventsSince(8)
 	if err == nil || !strings.Contains(err.Error(), "too old resource version") {
 		t.Errorf("unexpected error: %v", err)
 	}
 	// Getting events from 8 should return no events,
 	// even though there is a marker there.
-	result, err := store.GetAllEventsSince(9)
+	result, err := store.getAllEventsSince(9)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -313,7 +329,7 @@ func TestMarker(t *testing.T) {
 	pod := makeTestPod("pods", 12)
 	store.Add(pod)
 	// Getting events from 8 should still work and return one event.
-	result, err = store.GetAllEventsSince(9)
+	result, err = store.getAllEventsSince(9)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -351,7 +367,7 @@ func TestWaitUntilFreshAndList(t *testing.T) {
 	}()
 
 	// list by empty MatchValues.
-	list, resourceVersion, err := store.WaitUntilFreshAndList(5, nil, nil)
+	list, resourceVersion, indexUsed, err := store.WaitUntilFreshAndList(5, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -361,13 +377,16 @@ func TestWaitUntilFreshAndList(t *testing.T) {
 	if len(list) != 3 {
 		t.Errorf("unexpected list returned: %#v", list)
 	}
+	if indexUsed != "" {
+		t.Errorf("Used index %q but expected none to be used", indexUsed)
+	}
 
 	// list by label index.
 	matchValues := []storage.MatchValue{
 		{IndexName: "l:label", Value: "value1"},
 		{IndexName: "f:spec.nodeName", Value: "node2"},
 	}
-	list, resourceVersion, err = store.WaitUntilFreshAndList(5, matchValues, nil)
+	list, resourceVersion, indexUsed, err = store.WaitUntilFreshAndList(5, matchValues, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -377,13 +396,16 @@ func TestWaitUntilFreshAndList(t *testing.T) {
 	if len(list) != 2 {
 		t.Errorf("unexpected list returned: %#v", list)
 	}
+	if indexUsed != "l:label" {
+		t.Errorf("Used index %q but expected %q", indexUsed, "l:label")
+	}
 
 	// list with spec.nodeName index.
 	matchValues = []storage.MatchValue{
 		{IndexName: "l:not-exist-label", Value: "whatever"},
 		{IndexName: "f:spec.nodeName", Value: "node2"},
 	}
-	list, resourceVersion, err = store.WaitUntilFreshAndList(5, matchValues, nil)
+	list, resourceVersion, indexUsed, err = store.WaitUntilFreshAndList(5, matchValues, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -393,17 +415,26 @@ func TestWaitUntilFreshAndList(t *testing.T) {
 	if len(list) != 1 {
 		t.Errorf("unexpected list returned: %#v", list)
 	}
+	if indexUsed != "f:spec.nodeName" {
+		t.Errorf("Used index %q but expected %q", indexUsed, "f:spec.nodeName")
+	}
 
 	// list with index not exists.
 	matchValues = []storage.MatchValue{
 		{IndexName: "l:not-exist-label", Value: "whatever"},
 	}
-	list, resourceVersion, err = store.WaitUntilFreshAndList(5, matchValues, nil)
+	list, resourceVersion, indexUsed, err = store.WaitUntilFreshAndList(5, matchValues, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if resourceVersion != 5 {
 		t.Errorf("unexpected resourceVersion: %v, expected: 5", resourceVersion)
 	}
 	if len(list) != 3 {
 		t.Errorf("unexpected list returned: %#v", list)
+	}
+	if indexUsed != "" {
+		t.Errorf("Used index %q but expected none to be used", indexUsed)
 	}
 }
 
@@ -434,7 +465,7 @@ func TestWaitUntilFreshAndGet(t *testing.T) {
 
 func TestWaitUntilFreshAndListTimeout(t *testing.T) {
 	store := newTestWatchCache(3, &cache.Indexers{})
-	fc := store.clock.(*clock.FakeClock)
+	fc := store.clock.(*testingclock.FakeClock)
 
 	// In background, step clock after the below call starts the timer.
 	go func() {
@@ -450,7 +481,7 @@ func TestWaitUntilFreshAndListTimeout(t *testing.T) {
 		store.Add(makeTestPod("bar", 5))
 	}()
 
-	_, _, err := store.WaitUntilFreshAndList(5, nil, nil)
+	_, _, _, err := store.WaitUntilFreshAndList(5, nil, nil)
 	if !errors.IsTimeout(err) {
 		t.Errorf("expected timeout error but got: %v", err)
 	}
@@ -475,7 +506,7 @@ func TestReflectorForWatchCache(t *testing.T) {
 	store := newTestWatchCache(5, &cache.Indexers{})
 
 	{
-		_, version, err := store.WaitUntilFreshAndList(0, nil, nil)
+		_, version, _, err := store.WaitUntilFreshAndList(0, nil, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -498,7 +529,7 @@ func TestReflectorForWatchCache(t *testing.T) {
 	r.ListAndWatch(wait.NeverStop)
 
 	{
-		_, version, err := store.WaitUntilFreshAndList(10, nil, nil)
+		_, version, _, err := store.WaitUntilFreshAndList(10, nil, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -761,7 +792,7 @@ func TestDynamicCache(t *testing.T) {
 	}
 }
 
-func loadEventWithDuration(cache *watchCache, count int, interval time.Duration) {
+func loadEventWithDuration(cache *testWatchCache, count int, interval time.Duration) {
 	for i := 0; i < count; i++ {
 		event := &watchCacheEvent{
 			Key:        fmt.Sprintf("event-%d", i+cache.startIndex),
@@ -772,7 +803,7 @@ func loadEventWithDuration(cache *watchCache, count int, interval time.Duration)
 	cache.endIndex = cache.startIndex + count
 }
 
-func checkCacheElements(cache *watchCache) bool {
+func checkCacheElements(cache *testWatchCache) bool {
 	for i := cache.startIndex; i < cache.endIndex; i++ {
 		location := i % cache.capacity
 		if cache.cache[location].Key != fmt.Sprintf("event-%d", i) {
@@ -808,7 +839,7 @@ func TestCacheIncreaseDoesNotBreakWatch(t *testing.T) {
 	// Force cache resize.
 	addEvent("key4", 50, later.Add(time.Second))
 
-	_, err := store.GetAllEventsSince(15)
+	_, err := store.getAllEventsSince(15)
 	if err == nil || !strings.Contains(err.Error(), "too old resource version") {
 		t.Errorf("unexpected error: %v", err)
 	}

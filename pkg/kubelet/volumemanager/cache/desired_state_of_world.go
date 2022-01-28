@@ -23,6 +23,7 @@ package cache
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -120,6 +121,9 @@ type DesiredStateOfWorld interface {
 
 	// GetPodsWithErrors returns names of pods that have stored errors.
 	GetPodsWithErrors() []types.UniquePodName
+
+	// MarkVolumeAttachability updates the volume's attachability for a given volume
+	MarkVolumeAttachability(volumeName v1.UniqueVolumeName, attachable bool)
 }
 
 // VolumeToMount represents a volume that is attached to this node and needs to
@@ -204,6 +208,8 @@ type podToMount struct {
 	// volume claim, this contains the volume.Spec.Name() of the persistent
 	// volume claim
 	outerVolumeSpecName string
+	// mountRequestTime stores time at which mount was requested
+	mountRequestTime time.Time
 }
 
 const (
@@ -233,8 +239,8 @@ func (dsw *desiredStateOfWorld) AddPodToVolume(
 
 	// The unique volume name used depends on whether the volume is attachable/device-mountable
 	// or not.
-	attachable := dsw.isAttachableVolume(volumeSpec)
-	deviceMountable := dsw.isDeviceMountableVolume(volumeSpec)
+	attachable := util.IsAttachableVolume(volumeSpec, dsw.volumePluginMgr)
+	deviceMountable := util.IsDeviceMountableVolume(volumeSpec, dsw.volumePluginMgr)
 	if attachable || deviceMountable {
 		// For attachable/device-mountable volumes, use the unique volume name as reported by
 		// the plugin.
@@ -263,7 +269,7 @@ func (dsw *desiredStateOfWorld) AddPodToVolume(
 				if volumeSpec.Volume.EmptyDir != nil &&
 					volumeSpec.Volume.EmptyDir.SizeLimit != nil &&
 					volumeSpec.Volume.EmptyDir.SizeLimit.Value() > 0 &&
-					volumeSpec.Volume.EmptyDir.SizeLimit.Value() < sizeLimit.Value() {
+					(sizeLimit.Value() == 0 || volumeSpec.Volume.EmptyDir.SizeLimit.Value() < sizeLimit.Value()) {
 					sizeLimit = resource.NewQuantity(volumeSpec.Volume.EmptyDir.SizeLimit.Value(), resource.BinarySI)
 				}
 			}
@@ -278,6 +284,11 @@ func (dsw *desiredStateOfWorld) AddPodToVolume(
 			desiredSizeLimit:        sizeLimit,
 		}
 	}
+	oldPodMount, ok := dsw.volumesToMount[volumeName].podsToMount[podName]
+	mountRequestTime := time.Now()
+	if ok && !volumePlugin.RequiresRemount(volumeSpec) {
+		mountRequestTime = oldPodMount.mountRequestTime
+	}
 
 	// Create new podToMount object. If it already exists, it is refreshed with
 	// updated values (this is required for volumes that require remounting on
@@ -287,6 +298,7 @@ func (dsw *desiredStateOfWorld) AddPodToVolume(
 		pod:                 pod,
 		volumeSpec:          volumeSpec,
 		outerVolumeSpecName: outerVolumeSpecName,
+		mountRequestTime:    mountRequestTime,
 	}
 	return volumeName, nil
 }
@@ -404,35 +416,11 @@ func (dsw *desiredStateOfWorld) GetVolumesToMount() []VolumeToMount {
 						OuterVolumeSpecName:     podObj.outerVolumeSpecName,
 						VolumeGidValue:          volumeObj.volumeGidValue,
 						ReportedInUse:           volumeObj.reportedInUse,
+						MountRequestTime:        podObj.mountRequestTime,
 						DesiredSizeLimit:        volumeObj.desiredSizeLimit}})
 		}
 	}
 	return volumesToMount
-}
-
-func (dsw *desiredStateOfWorld) isAttachableVolume(volumeSpec *volume.Spec) bool {
-	attachableVolumePlugin, _ :=
-		dsw.volumePluginMgr.FindAttachablePluginBySpec(volumeSpec)
-	if attachableVolumePlugin != nil {
-		volumeAttacher, err := attachableVolumePlugin.NewAttacher()
-		if err == nil && volumeAttacher != nil {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (dsw *desiredStateOfWorld) isDeviceMountableVolume(volumeSpec *volume.Spec) bool {
-	deviceMountableVolumePlugin, _ := dsw.volumePluginMgr.FindDeviceMountablePluginBySpec(volumeSpec)
-	if deviceMountableVolumePlugin != nil {
-		volumeDeviceMounter, err := deviceMountableVolumePlugin.NewDeviceMounter()
-		if err == nil && volumeDeviceMounter != nil {
-			return true
-		}
-	}
-
-	return false
 }
 
 func (dsw *desiredStateOfWorld) AddErrorToPod(podName types.UniquePodName, err string) {
@@ -468,4 +456,15 @@ func (dsw *desiredStateOfWorld) GetPodsWithErrors() []types.UniquePodName {
 		pods = append(pods, podName)
 	}
 	return pods
+}
+
+func (dsw *desiredStateOfWorld) MarkVolumeAttachability(volumeName v1.UniqueVolumeName, attachable bool) {
+	dsw.Lock()
+	defer dsw.Unlock()
+	volumeObj, volumeExists := dsw.volumesToMount[volumeName]
+	if !volumeExists {
+		return
+	}
+	volumeObj.pluginIsAttachable = attachable
+	dsw.volumesToMount[volumeName] = volumeObj
 }

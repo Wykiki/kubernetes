@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	unstructuredv1 "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/discovery"
@@ -90,6 +91,7 @@ var _ = SIGDescribe("Aggregator", func() {
 	})
 
 	/*
+		    Release: v1.17, v1.21
 		    Testname: aggregator-supports-the-sample-apiserver
 		    Description: Ensure that the sample-apiserver code from 1.17 and compiled against 1.17
 			will work on the current Aggregator/API-Server.
@@ -98,6 +100,7 @@ var _ = SIGDescribe("Aggregator", func() {
 		// Testing a 1.17 version of the sample-apiserver
 		TestSampleAPIServer(f, aggrclient, imageutils.GetE2EImage(imageutils.APIServer))
 	})
+
 })
 
 func cleanTest(client clientset.Interface, aggrclient *aggregatorclient.Clientset, namespace string) {
@@ -199,7 +202,6 @@ func TestSampleAPIServer(f *framework.Framework, aggrclient *aggregatorclient.Cl
 	etcdImage := imageutils.GetE2EImage(imageutils.Etcd)
 	podLabels := map[string]string{"app": "sample-apiserver", "apiserver": "true"}
 	replicas := int32(1)
-	zero := int64(0)
 	etcdLocalhostAddress := "127.0.0.1"
 	if framework.TestContext.ClusterIsIPv6() {
 		etcdLocalhostAddress = "::1"
@@ -247,31 +249,10 @@ func TestSampleAPIServer(f *framework.Framework, aggrclient *aggregatorclient.Cl
 			},
 		},
 	}
-	d := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   deploymentName,
-			Labels: podLabels,
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: podLabels,
-			},
-			Strategy: appsv1.DeploymentStrategy{
-				Type: appsv1.RollingUpdateDeploymentStrategyType,
-			},
-			Template: v1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: podLabels,
-				},
-				Spec: v1.PodSpec{
-					TerminationGracePeriodSeconds: &zero,
-					Containers:                    containers,
-					Volumes:                       volumes,
-				},
-			},
-		},
-	}
+	d := e2edeployment.NewDeployment(deploymentName, replicas, podLabels, "", "", appsv1.RollingUpdateDeploymentStrategyType)
+	d.Spec.Template.Spec.Containers = containers
+	d.Spec.Template.Spec.Volumes = volumes
+
 	deployment, err := client.AppsV1().Deployments(namespace).Create(context.TODO(), d, metav1.CreateOptions{})
 	framework.ExpectNoError(err, "creating deployment %s in namespace %s", deploymentName, namespace)
 
@@ -374,7 +355,7 @@ func TestSampleAPIServer(f *framework.Framework, aggrclient *aggregatorclient.Cl
 			if !ok {
 				return false, err
 			}
-			if status.Status().Code == 503 {
+			if status.Status().Code == 403 || status.Status().Code == 503 {
 				return false, nil
 			}
 			if status.Status().Code == 404 && strings.HasPrefix(err.Error(), "the server could not find the requested resource") {
@@ -488,6 +469,51 @@ func TestSampleAPIServer(f *framework.Framework, aggrclient *aggregatorclient.Cl
 	framework.ExpectNoError(err, "listing flunders using dynamic client")
 	if len(unstructuredList.Items) != 1 {
 		framework.Failf("failed to get back the correct flunders list %v from the dynamic client", unstructuredList)
+	}
+
+	ginkgo.By("Read Status for v1alpha1.wardle.example.com")
+	statusContent, err := restClient.Get().
+		AbsPath("/apis/apiregistration.k8s.io/v1/apiservices/v1alpha1.wardle.example.com/status").
+		SetHeader("Accept", "application/json").DoRaw(context.TODO())
+	framework.ExpectNoError(err, "No response for .../apiservices/v1alpha1.wardle.example.com/status. Error: %v", err)
+
+	var jr *apiregistrationv1.APIService
+	err = json.Unmarshal([]byte(statusContent), &jr)
+	framework.ExpectNoError(err, "Failed to process statusContent: %v | err: %v ", string(statusContent), err)
+	framework.ExpectEqual(jr.Status.Conditions[0].Message, "all checks passed", "The Message returned was %v", jr.Status.Conditions[0].Message)
+
+	ginkgo.By("kubectl patch apiservice v1alpha1.wardle.example.com -p '{\"spec\":{\"versionPriority\": 400}}'")
+	patchContent, err := restClient.Patch(types.MergePatchType).
+		AbsPath("/apis/apiregistration.k8s.io/v1/apiservices/v1alpha1.wardle.example.com").
+		SetHeader("Accept", "application/json").
+		Body([]byte(`{"spec":{"versionPriority": 400}}`)).DoRaw(context.TODO())
+
+	framework.ExpectNoError(err, "Patch failed for .../apiservices/v1alpha1.wardle.example.com. Error: %v", err)
+	err = json.Unmarshal([]byte(patchContent), &jr)
+	framework.ExpectNoError(err, "Failed to process patchContent: %v | err: %v ", string(patchContent), err)
+	framework.ExpectEqual(jr.Spec.VersionPriority, int32(400), "The VersionPriority returned was %d", jr.Spec.VersionPriority)
+
+	ginkgo.By("List APIServices")
+	listApiservices, err := restClient.Get().
+		AbsPath("/apis/apiregistration.k8s.io/v1/apiservices").
+		SetHeader("Accept", "application/json").DoRaw(context.TODO())
+
+	framework.ExpectNoError(err, "No response for /apis/apiregistration.k8s.io/v1/apiservices Error: %v", err)
+
+	var list *apiregistrationv1.APIServiceList
+	err = json.Unmarshal([]byte(listApiservices), &list)
+	framework.ExpectNoError(err, "Failed to process APIServiceList: %v | err: %v ", list, err)
+
+	locatedWardle := false
+	for _, item := range list.Items {
+		if item.Name == "v1alpha1.wardle.example.com" {
+			framework.Logf("Found v1alpha1.wardle.example.com in APIServiceList")
+			locatedWardle = true
+			break
+		}
+	}
+	if !locatedWardle {
+		framework.Failf("Unable to find v1alpha1.wardle.example.com in APIServiceList")
 	}
 
 	// kubectl delete flunder test-flunder

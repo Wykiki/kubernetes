@@ -23,20 +23,16 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/fake"
-	"k8s.io/client-go/tools/record"
 	kubepod "k8s.io/kubernetes/pkg/kubelet/pod"
 	"k8s.io/kubernetes/pkg/kubelet/prober/results"
 	"k8s.io/kubernetes/pkg/kubelet/status"
 	statustest "k8s.io/kubernetes/pkg/kubelet/status/testing"
 	"k8s.io/kubernetes/pkg/probe"
-	"k8s.io/utils/exec"
 )
 
 func init() {
-	runtime.ReallyCrash = true
 }
 
 func TestDoProbe(t *testing.T) {
@@ -58,25 +54,47 @@ func TestDoProbe(t *testing.T) {
 		failedStatus.Phase = v1.PodFailed
 
 		tests := []struct {
-			probe          v1.Probe
-			podStatus      *v1.PodStatus
-			expectContinue bool
-			expectSet      bool
-			expectedResult results.Result
+			probe                v1.Probe
+			podStatus            *v1.PodStatus
+			expectContinue       map[string]bool
+			expectSet            bool
+			expectedResult       results.Result
+			setDeletionTimestamp bool
 		}{
 			{ // No status.
-				expectContinue: true,
+				expectContinue: map[string]bool{
+					liveness.String():  true,
+					readiness.String(): true,
+					startup.String():   true,
+				},
 			},
 			{ // Pod failed
 				podStatus: &failedStatus,
 			},
+			{ // Pod deletion
+				podStatus:            &runningStatus,
+				setDeletionTimestamp: true,
+				expectSet:            true,
+				expectContinue: map[string]bool{
+					readiness.String(): true,
+				},
+				expectedResult: results.Success,
+			},
 			{ // No container status
-				podStatus:      &otherStatus,
-				expectContinue: true,
+				podStatus: &otherStatus,
+				expectContinue: map[string]bool{
+					liveness.String():  true,
+					readiness.String(): true,
+					startup.String():   true,
+				},
 			},
 			{ // Container waiting
-				podStatus:      &pendingStatus,
-				expectContinue: true,
+				podStatus: &pendingStatus,
+				expectContinue: map[string]bool{
+					liveness.String():  true,
+					readiness.String(): true,
+					startup.String():   true,
+				},
 				expectSet:      true,
 				expectedResult: results.Failure,
 			},
@@ -86,8 +104,12 @@ func TestDoProbe(t *testing.T) {
 				expectedResult: results.Failure,
 			},
 			{ // Probe successful.
-				podStatus:      &runningStatus,
-				expectContinue: true,
+				podStatus: &runningStatus,
+				expectContinue: map[string]bool{
+					liveness.String():  true,
+					readiness.String(): true,
+					startup.String():   true,
+				},
 				expectSet:      true,
 				expectedResult: results.Success,
 			},
@@ -96,7 +118,11 @@ func TestDoProbe(t *testing.T) {
 				probe: v1.Probe{
 					InitialDelaySeconds: -100,
 				},
-				expectContinue: true,
+				expectContinue: map[string]bool{
+					liveness.String():  true,
+					readiness.String(): true,
+					startup.String():   true,
+				},
 				expectSet:      true,
 				expectedResult: results.Success,
 			},
@@ -107,8 +133,12 @@ func TestDoProbe(t *testing.T) {
 			if test.podStatus != nil {
 				m.statusManager.SetPodStatus(w.pod, *test.podStatus)
 			}
-			if c := w.doProbe(); c != test.expectContinue {
-				t.Errorf("[%s-%d] Expected continue to be %v but got %v", probeType, i, test.expectContinue, c)
+			if test.setDeletionTimestamp {
+				now := metav1.Now()
+				w.pod.ObjectMeta.DeletionTimestamp = &now
+			}
+			if c := w.doProbe(); c != test.expectContinue[probeType.String()] {
+				t.Errorf("[%s-%d] Expected continue to be %v but got %v", probeType, i, test.expectContinue[probeType.String()], c)
 			}
 			result, ok := resultsManager(m, probeType).Get(testContainerID)
 			if ok != test.expectSet {
@@ -119,7 +149,7 @@ func TestDoProbe(t *testing.T) {
 			}
 
 			// Clean up.
-			m.statusManager = status.NewManager(&fake.Clientset{}, kubepod.NewBasicPodManager(nil, nil, nil, nil), &statustest.FakePodDeletionSafetyProvider{})
+			m.statusManager = status.NewManager(&fake.Clientset{}, kubepod.NewBasicPodManager(nil, nil, nil), &statustest.FakePodDeletionSafetyProvider{})
 			resultsManager(m, probeType).Remove(testContainerID)
 		}
 	}
@@ -249,7 +279,7 @@ func TestCleanUp(t *testing.T) {
 		for i := 0; i < 10; i++ {
 			w.stop() // Stop should be callable multiple times without consequence.
 		}
-		if err := waitForWorkerExit(m, []probeKey{key}); err != nil {
+		if err := waitForWorkerExit(t, m, []probeKey{key}); err != nil {
 			t.Fatalf("[%s] error waiting for worker exit: %v", probeType, err)
 		}
 
@@ -260,27 +290,6 @@ func TestCleanUp(t *testing.T) {
 			t.Errorf("[%s] Expected worker to be cleared.", probeType)
 		}
 	}
-}
-
-func TestHandleCrash(t *testing.T) {
-	runtime.ReallyCrash = false // Test that we *don't* really crash.
-
-	m := newTestManager()
-	w := newTestWorker(m, readiness, v1.Probe{})
-	m.statusManager.SetPodStatus(w.pod, getTestRunningStatus())
-
-	expectContinue(t, w, w.doProbe(), "Initial successful probe.")
-	expectResult(t, w, results.Success, "Initial successful probe.")
-
-	// Prober starts crashing.
-	m.prober = &prober{
-		recorder: &record.FakeRecorder{},
-		exec:     crashingExecProber{},
-	}
-
-	// doProbe should recover from the crash, and keep going.
-	expectContinue(t, w, w.doProbe(), "Crashing probe.")
-	expectResult(t, w, results.Success, "Crashing probe unchanged.")
 }
 
 func expectResult(t *testing.T, w *worker, expectedResult results.Result, msg string) {
@@ -309,12 +318,6 @@ func resultsManager(m *manager, probeType probeType) results.Manager {
 		return m.startupManager
 	}
 	panic(fmt.Errorf("Unhandled case: %v", probeType))
-}
-
-type crashingExecProber struct{}
-
-func (p crashingExecProber) Probe(_ exec.Cmd) (probe.Result, string, error) {
-	panic("Intentional Probe crash.")
 }
 
 func TestOnHoldOnLivenessOrStartupCheckFailure(t *testing.T) {

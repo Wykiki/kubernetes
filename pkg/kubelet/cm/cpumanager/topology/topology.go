@@ -18,8 +18,6 @@ package topology
 
 import (
 	"fmt"
-	"io/ioutil"
-	"strings"
 
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	"k8s.io/klog/v2"
@@ -36,12 +34,14 @@ type CPUDetails map[int]CPUInfo
 // CPUTopology contains details of node cpu, where :
 // CPU  - logical CPU, cadvisor - thread
 // Core - physical CPU, cadvisor - Core
-// Socket - socket, cadvisor - Node
+// Socket - socket, cadvisor - Socket
+// NUMA Node - NUMA cell, cadvisor - Node
 type CPUTopology struct {
-	NumCPUs    int
-	NumCores   int
-	NumSockets int
-	CPUDetails CPUDetails
+	NumCPUs      int
+	NumCores     int
+	NumSockets   int
+	NumNUMANodes int
+	CPUDetails   CPUDetails
 }
 
 // CPUsPerCore returns the number of logical CPUs are associated with
@@ -218,7 +218,7 @@ func (d CPUDetails) CPUsInCores(ids ...int) cpuset.CPUSet {
 }
 
 // Discover returns CPUTopology based on cadvisor node info
-func Discover(machineInfo *cadvisorapi.MachineInfo, numaNodeInfo NUMANodeInfo) (*CPUTopology, error) {
+func Discover(machineInfo *cadvisorapi.MachineInfo) (*CPUTopology, error) {
 	if machineInfo.NumCores == 0 {
 		return nil, fmt.Errorf("could not detect number of cpus")
 	}
@@ -226,42 +226,36 @@ func Discover(machineInfo *cadvisorapi.MachineInfo, numaNodeInfo NUMANodeInfo) (
 	CPUDetails := CPUDetails{}
 	numPhysicalCores := 0
 
-	for _, socket := range machineInfo.Topology {
-		numPhysicalCores += len(socket.Cores)
-		for _, core := range socket.Cores {
+	for _, node := range machineInfo.Topology {
+		numPhysicalCores += len(node.Cores)
+		for _, core := range node.Cores {
 			if coreID, err := getUniqueCoreID(core.Threads); err == nil {
 				for _, cpu := range core.Threads {
-					numaNodeID := 0
-					for id, cset := range numaNodeInfo {
-						if cset.Contains(cpu) {
-							numaNodeID = id
-						}
-					}
 					CPUDetails[cpu] = CPUInfo{
 						CoreID:     coreID,
-						SocketID:   socket.Id,
-						NUMANodeID: numaNodeID,
+						SocketID:   core.SocketID,
+						NUMANodeID: node.Id,
 					}
 				}
 			} else {
-				klog.Errorf("could not get unique coreID for socket: %d core %d threads: %v",
-					socket.Id, core.Id, core.Threads)
+				klog.ErrorS(nil, "Could not get unique coreID for socket", "socket", core.SocketID, "core", core.Id, "threads", core.Threads)
 				return nil, err
 			}
 		}
 	}
 
 	return &CPUTopology{
-		NumCPUs:    machineInfo.NumCores,
-		NumSockets: len(machineInfo.Topology),
-		NumCores:   numPhysicalCores,
-		CPUDetails: CPUDetails,
+		NumCPUs:      machineInfo.NumCores,
+		NumSockets:   machineInfo.NumSockets,
+		NumCores:     numPhysicalCores,
+		NumNUMANodes: CPUDetails.NUMANodes().Size(),
+		CPUDetails:   CPUDetails,
 	}, nil
 }
 
 // getUniqueCoreID computes coreId as the lowest cpuID
 // for a given Threads []int slice. This will assure that coreID's are
-// platform unique (opposite to what cAdvisor reports - socket unique)
+// platform unique (opposite to what cAdvisor reports)
 func getUniqueCoreID(threads []int) (coreID int, err error) {
 	if len(threads) == 0 {
 		return 0, fmt.Errorf("no cpus provided")
@@ -279,50 +273,4 @@ func getUniqueCoreID(threads []int) (coreID int, err error) {
 	}
 
 	return min, nil
-}
-
-// GetNUMANodeInfo uses sysfs to return a map of NUMANode id to the list of
-// CPUs associated with that NUMANode.
-//
-// TODO: This is a temporary workaround until cadvisor provides this
-// information directly in machineInfo. We should remove this once this
-// information is available from cadvisor.
-func GetNUMANodeInfo() (NUMANodeInfo, error) {
-	// Get the possible NUMA nodes on this machine. If reading this file
-	// is not possible, this is not an error. Instead, we just return a
-	// nil NUMANodeInfo, indicating that no NUMA information is available
-	// on this machine. This should implicitly be interpreted as having a
-	// single NUMA node with id 0 for all CPUs.
-	nodelist, err := ioutil.ReadFile("/sys/devices/system/node/online")
-	if err != nil {
-		return nil, nil
-	}
-
-	// Parse the nodelist into a set of Node IDs
-	nodes, err := cpuset.Parse(strings.TrimSpace(string(nodelist)))
-	if err != nil {
-		return nil, err
-	}
-
-	info := make(NUMANodeInfo)
-
-	// For each node...
-	for _, node := range nodes.ToSlice() {
-		// Read the 'cpulist' of the NUMA node from sysfs.
-		path := fmt.Sprintf("/sys/devices/system/node/node%d/cpulist", node)
-		cpulist, err := ioutil.ReadFile(path)
-		if err != nil {
-			return nil, err
-		}
-
-		// Convert the 'cpulist' into a set of CPUs.
-		cpus, err := cpuset.Parse(strings.TrimSpace(string(cpulist)))
-		if err != nil {
-			return nil, err
-		}
-
-		info[node] = cpus
-	}
-
-	return info, nil
 }

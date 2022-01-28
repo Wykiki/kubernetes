@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -65,12 +66,13 @@ func GetTestCloud(ctrl *gomock.Controller) (az *Cloud) {
 			MaximumLoadBalancerRuleCount: 250,
 			VMType:                       vmTypeStandard,
 		},
-		nodeZones:          map[string]sets.String{},
-		nodeInformerSynced: func() bool { return true },
-		nodeResourceGroups: map[string]string{},
-		unmanagedNodes:     sets.NewString(),
-		routeCIDRs:         map[string]string{},
-		eventRecorder:      &record.FakeRecorder{},
+		nodeZones:                map[string]sets.String{},
+		nodeInformerSynced:       func() bool { return true },
+		nodeResourceGroups:       map[string]string{},
+		unmanagedNodes:           sets.NewString(),
+		excludeLoadBalancerNodes: sets.NewString(),
+		routeCIDRs:               map[string]string{},
+		eventRecorder:            &record.FakeRecorder{},
 	}
 	az.DisksClient = mockdiskclient.NewMockInterface(ctrl)
 	az.InterfacesClient = mockinterfaceclient.NewMockInterface(ctrl)
@@ -83,13 +85,13 @@ func GetTestCloud(ctrl *gomock.Controller) (az *Cloud) {
 	az.VirtualMachineScaleSetsClient = mockvmssclient.NewMockInterface(ctrl)
 	az.VirtualMachineScaleSetVMsClient = mockvmssvmclient.NewMockInterface(ctrl)
 	az.VirtualMachinesClient = mockvmclient.NewMockInterface(ctrl)
-	az.vmSet = newAvailabilitySet(az)
+	az.VMSet = newAvailabilitySet(az)
 	az.vmCache, _ = az.newVMCache()
 	az.lbCache, _ = az.newLBCache()
 	az.nsgCache, _ = az.newNSGCache()
 	az.rtCache, _ = az.newRouteTableCache()
 
-	common := &controllerCommon{cloud: az}
+	common := &controllerCommon{cloud: az, resourceGroup: "rg", location: "westus"}
 	az.controllerCommon = common
 	az.ManagedDiskController = &ManagedDiskController{common: common}
 

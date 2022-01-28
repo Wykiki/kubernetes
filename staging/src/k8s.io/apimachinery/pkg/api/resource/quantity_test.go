@@ -18,12 +18,16 @@ package resource
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"math/rand"
+	"os"
 	"strings"
 	"testing"
 	"unicode"
 
 	fuzz "github.com/google/gofuzz"
+	"github.com/spf13/pflag"
 
 	inf "gopkg.in/inf.v0"
 )
@@ -388,6 +392,16 @@ func TestQuantityParse(t *testing.T) {
 
 			if asDec {
 				got.AsDec()
+			}
+
+			for _, format := range []Format{DecimalSI, BinarySI, DecimalExponent} {
+				// ensure we are not simply checking pointer equality by creating a new inf.Dec
+				var copied inf.Dec
+				copied.Add(inf.NewDec(0, inf.Scale(0)), got.AsDec())
+				q := NewDecimalQuantity(copied, format)
+				if c := q.Cmp(got); c != 0 {
+					t.Errorf("%v: round trip from decimal back to quantity is not comparable: %d: %#v vs %#v", item.input, c, got, q)
+				}
 			}
 
 			// verify that we can decompose the input and get the same result by building up from the base.
@@ -1177,6 +1191,111 @@ func TestNegateRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestQuantityAsApproximateFloat64(t *testing.T) {
+	table := []struct {
+		in  Quantity
+		out float64
+	}{
+		{decQuantity(0, 0, DecimalSI), 0.0},
+		{decQuantity(0, 0, DecimalExponent), 0.0},
+		{decQuantity(0, 0, BinarySI), 0.0},
+
+		{decQuantity(1, 0, DecimalSI), 1},
+		{decQuantity(1, 0, DecimalExponent), 1},
+		{decQuantity(1, 0, BinarySI), 1},
+
+		// Binary suffixes
+		{decQuantity(1024, 0, BinarySI), 1024},
+		{decQuantity(8*1024, 0, BinarySI), 8 * 1024},
+		{decQuantity(7*1024*1024, 0, BinarySI), 7 * 1024 * 1024},
+		{decQuantity(7*1024*1024, 1, BinarySI), (7 * 1024 * 1024) * 10},
+		{decQuantity(7*1024*1024, 4, BinarySI), (7 * 1024 * 1024) * 10000},
+		{decQuantity(7*1024*1024, 8, BinarySI), (7 * 1024 * 1024) * 100000000},
+		{decQuantity(7*1024*1024, -1, BinarySI), (7 * 1024 * 1024) * math.Pow10(-1)}, // '* Pow10' and '/ float(10)' do not round the same way
+		{decQuantity(7*1024*1024, -8, BinarySI), (7 * 1024 * 1024) / float64(100000000)},
+
+		{decQuantity(1024, 0, DecimalSI), 1024},
+		{decQuantity(8*1024, 0, DecimalSI), 8 * 1024},
+		{decQuantity(7*1024*1024, 0, DecimalSI), 7 * 1024 * 1024},
+		{decQuantity(7*1024*1024, 1, DecimalSI), (7 * 1024 * 1024) * 10},
+		{decQuantity(7*1024*1024, 4, DecimalSI), (7 * 1024 * 1024) * 10000},
+		{decQuantity(7*1024*1024, 8, DecimalSI), (7 * 1024 * 1024) * 100000000},
+		{decQuantity(7*1024*1024, -1, DecimalSI), (7 * 1024 * 1024) * math.Pow10(-1)}, // '* Pow10' and '/ float(10)' do not round the same way
+		{decQuantity(7*1024*1024, -8, DecimalSI), (7 * 1024 * 1024) / float64(100000000)},
+
+		{decQuantity(1024, 0, DecimalExponent), 1024},
+		{decQuantity(8*1024, 0, DecimalExponent), 8 * 1024},
+		{decQuantity(7*1024*1024, 0, DecimalExponent), 7 * 1024 * 1024},
+		{decQuantity(7*1024*1024, 1, DecimalExponent), (7 * 1024 * 1024) * 10},
+		{decQuantity(7*1024*1024, 4, DecimalExponent), (7 * 1024 * 1024) * 10000},
+		{decQuantity(7*1024*1024, 8, DecimalExponent), (7 * 1024 * 1024) * 100000000},
+		{decQuantity(7*1024*1024, -1, DecimalExponent), (7 * 1024 * 1024) * math.Pow10(-1)}, // '* Pow10' and '/ float(10)' do not round the same way
+		{decQuantity(7*1024*1024, -8, DecimalExponent), (7 * 1024 * 1024) / float64(100000000)},
+
+		// very large numbers
+		{Quantity{d: maxAllowed, Format: DecimalSI}, math.MaxInt64},
+		{Quantity{d: maxAllowed, Format: BinarySI}, math.MaxInt64},
+		{decQuantity(12, 18, DecimalSI), 1.2e19},
+
+		// infinities caused due to float64 overflow
+		{decQuantity(12, 500, DecimalSI), math.Inf(0)},
+		{decQuantity(-12, 500, DecimalSI), math.Inf(-1)},
+	}
+
+	for _, item := range table {
+		t.Run(fmt.Sprintf("%s %s", item.in.Format, item.in.String()), func(t *testing.T) {
+			out := item.in.AsApproximateFloat64()
+			if out != item.out {
+				t.Fatalf("expected %v, got %v", item.out, out)
+			}
+			if item.in.d.Dec != nil {
+				if i, ok := item.in.AsInt64(); ok {
+					q := intQuantity(i, 0, item.in.Format)
+					out := q.AsApproximateFloat64()
+					if out != item.out {
+						t.Fatalf("as int quantity: expected %v, got %v", item.out, out)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestStringQuantityAsApproximateFloat64(t *testing.T) {
+	table := []struct {
+		in  string
+		out float64
+	}{
+		{"2Ki", 2048},
+		{"1.1Ki", 1126.4e+0},
+		{"1Mi", 1.048576e+06},
+		{"2Gi", 2.147483648e+09},
+	}
+
+	for _, item := range table {
+		t.Run(item.in, func(t *testing.T) {
+			in, err := ParseQuantity(item.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := in.AsApproximateFloat64()
+			if out != item.out {
+				t.Fatalf("expected %v, got %v", item.out, out)
+			}
+			if in.d.Dec != nil {
+				if i, ok := in.AsInt64(); ok {
+					q := intQuantity(i, 0, in.Format)
+					out := q.AsApproximateFloat64()
+					if out != item.out {
+						t.Fatalf("as int quantity: expected %v, got %v", item.out, out)
+					}
+				}
+			}
+		})
+	}
+}
+
 func benchmarkQuantities() []Quantity {
 	return []Quantity{
 		intQuantity(1024*1024*1024, 0, BinarySI),
@@ -1345,4 +1464,55 @@ func BenchmarkQuantityCmp(b *testing.B) {
 		}
 	}
 	b.StopTimer()
+}
+
+func BenchmarkQuantityAsApproximateFloat64(b *testing.B) {
+	values := benchmarkQuantities()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		q := values[i%len(values)]
+		if q.AsApproximateFloat64() == -1 {
+			b.Fatal(q)
+		}
+	}
+	b.StopTimer()
+}
+
+var _ pflag.Value = &QuantityValue{}
+
+func TestQuantityValueSet(t *testing.T) {
+	q := QuantityValue{}
+
+	if err := q.Set("invalid"); err == nil {
+
+		t.Error("'invalid' did not trigger a parse error")
+	}
+
+	if err := q.Set("1Mi"); err != nil {
+		t.Errorf("parsing 1Mi should have worked, got: %v", err)
+	}
+	if q.Value() != 1024*1024 {
+		t.Errorf("quantity should have been set to 1Mi, got: %v", q)
+	}
+
+	data, err := json.Marshal(q)
+	if err != nil {
+		t.Errorf("unexpected encoding error: %v", err)
+	}
+	expected := `"1Mi"`
+	if string(data) != expected {
+		t.Errorf("expected 1Mi value to be encoded as %q, got: %q", expected, string(data))
+	}
+}
+
+func ExampleQuantityValue() {
+	q := QuantityValue{
+		Quantity: MustParse("1Mi"),
+	}
+	fs := pflag.FlagSet{}
+	fs.SetOutput(os.Stdout)
+	fs.Var(&q, "mem", "sets amount of memory")
+	fs.PrintDefaults()
+	// Output:
+	// --mem quantity   sets amount of memory (default 1Mi)
 }

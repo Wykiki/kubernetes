@@ -29,7 +29,6 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
-	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
@@ -166,6 +165,7 @@ func testReboot(c clientset.Interface, rebootCmd string, hook terminationHook) {
 	failed := false
 	for ix := range nodelist.Items {
 		go func(ix int) {
+			defer ginkgo.GinkgoRecover()
 			defer wg.Done()
 			n := nodelist.Items[ix]
 			result[ix] = rebootNode(c, framework.TestContext.Provider, n.ObjectMeta.Name, rebootCmd)
@@ -239,7 +239,7 @@ func printStatusAndLogsForNotReadyPods(c clientset.Interface, ns string, podName
 func rebootNode(c clientset.Interface, provider, name, rebootCmd string) bool {
 	// Setup
 	ns := metav1.NamespaceSystem
-	ps, err := testutils.NewPodStore(c, ns, labels.Everything(), fields.OneTermEqualSelector(api.PodHostField, name))
+	ps, err := testutils.NewPodStore(c, ns, labels.Everything(), fields.OneTermEqualSelector("spec.nodeName", name))
 	if err != nil {
 		framework.Logf("Couldn't initialize pod store: %v", err)
 		return false

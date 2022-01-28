@@ -18,6 +18,7 @@ package e2enode
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -37,29 +38,26 @@ import (
 	"k8s.io/component-base/featuregate"
 	internalapi "k8s.io/cri-api/pkg/apis"
 	"k8s.io/klog/v2"
-	kubeletconfigv1beta1 "k8s.io/kubelet/config/v1beta1"
-	"k8s.io/kubernetes/pkg/features"
+	kubeletpodresourcesv1 "k8s.io/kubelet/pkg/apis/podresources/v1"
+	kubeletpodresourcesv1alpha1 "k8s.io/kubelet/pkg/apis/podresources/v1alpha1"
+	stats "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/apis/podresources"
-	kubeletpodresourcesv1alpha1 "k8s.io/kubernetes/pkg/kubelet/apis/podresources/v1alpha1"
-	kubeletstatsv1alpha1 "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	"k8s.io/kubernetes/pkg/kubelet/cri/remote"
-	kubeletconfigcodec "k8s.io/kubernetes/pkg/kubelet/kubeletconfig/util/codec"
 	kubeletmetrics "k8s.io/kubernetes/pkg/kubelet/metrics"
 	"k8s.io/kubernetes/pkg/kubelet/util"
+
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2ekubelet "k8s.io/kubernetes/test/e2e/framework/kubelet"
 	e2emetrics "k8s.io/kubernetes/test/e2e/framework/metrics"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
+	e2enodekubelet "k8s.io/kubernetes/test/e2e_node/kubeletconfig"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 
 	"github.com/onsi/ginkgo"
 	"github.com/onsi/gomega"
 )
-
-// TODO(random-liu): Get this automatically from kubelet flag.
-var kubeletAddress = flag.String("kubelet-address", "http://127.0.0.1:10255", "Host and port of the kubelet")
 
 var startServices = flag.Bool("start-services", true, "If true, start local node services")
 var stopServices = flag.Bool("stop-services", true, "If true, stop local node services after running tests")
@@ -72,10 +70,19 @@ const (
 	defaultPodResourcesPath    = "/var/lib/kubelet/pod-resources"
 	defaultPodResourcesTimeout = 10 * time.Second
 	defaultPodResourcesMaxSize = 1024 * 1024 * 16 // 16 Mb
+	kubeletReadOnlyPort        = "10255"
+	kubeletHealthCheckURL      = "http://127.0.0.1:" + kubeletReadOnlyPort + "/healthz"
+	// state files
+	cpuManagerStateFile    = "/var/lib/kubelet/cpu_manager_state"
+	memoryManagerStateFile = "/var/lib/kubelet/memory_manager_state"
 )
 
-func getNodeSummary() (*kubeletstatsv1alpha1.Summary, error) {
-	req, err := http.NewRequest("GET", *kubeletAddress+"/stats/summary", nil)
+func getNodeSummary() (*stats.Summary, error) {
+	kubeletConfig, err := getCurrentKubeletConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current kubelet config")
+	}
+	req, err := http.NewRequest("GET", fmt.Sprintf("http://%s:%d/stats/summary", kubeletConfig.Address, kubeletConfig.ReadOnlyPort), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build http request: %v", err)
 	}
@@ -94,7 +101,7 @@ func getNodeSummary() (*kubeletstatsv1alpha1.Summary, error) {
 	}
 
 	decoder := json.NewDecoder(strings.NewReader(string(contentsBytes)))
-	summary := kubeletstatsv1alpha1.Summary{}
+	summary := stats.Summary{}
 	err = decoder.Decode(&summary)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse /stats/summary to go struct: %+v", resp)
@@ -102,12 +109,12 @@ func getNodeSummary() (*kubeletstatsv1alpha1.Summary, error) {
 	return &summary, nil
 }
 
-func getNodeDevices() (*kubeletpodresourcesv1alpha1.ListPodResourcesResponse, error) {
+func getV1alpha1NodeDevices() (*kubeletpodresourcesv1alpha1.ListPodResourcesResponse, error) {
 	endpoint, err := util.LocalEndpoint(defaultPodResourcesPath, podresources.Socket)
 	if err != nil {
 		return nil, fmt.Errorf("Error getting local endpoint: %v", err)
 	}
-	client, conn, err := podresources.GetClient(endpoint, defaultPodResourcesTimeout, defaultPodResourcesMaxSize)
+	client, conn, err := podresources.GetV1alpha1Client(endpoint, defaultPodResourcesTimeout, defaultPodResourcesMaxSize)
 	if err != nil {
 		return nil, fmt.Errorf("Error getting grpc client: %v", err)
 	}
@@ -115,6 +122,25 @@ func getNodeDevices() (*kubeletpodresourcesv1alpha1.ListPodResourcesResponse, er
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	resp, err := client.List(ctx, &kubeletpodresourcesv1alpha1.ListPodResourcesRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("%v.Get(_) = _, %v", client, err)
+	}
+	return resp, nil
+}
+
+func getV1NodeDevices() (*kubeletpodresourcesv1.ListPodResourcesResponse, error) {
+	endpoint, err := util.LocalEndpoint(defaultPodResourcesPath, podresources.Socket)
+	if err != nil {
+		return nil, fmt.Errorf("Error getting local endpoint: %v", err)
+	}
+	client, conn, err := podresources.GetV1Client(endpoint, defaultPodResourcesTimeout, defaultPodResourcesMaxSize)
+	if err != nil {
+		return nil, fmt.Errorf("Error getting gRPC client: %v", err)
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := client.List(ctx, &kubeletpodresourcesv1.ListPodResourcesRequest{})
 	if err != nil {
 		return nil, fmt.Errorf("%v.Get(_) = _, %v", client, err)
 	}
@@ -132,147 +158,66 @@ func getCurrentKubeletConfig() (*kubeletconfig.KubeletConfiguration, error) {
 // Returns true on success.
 func tempSetCurrentKubeletConfig(f *framework.Framework, updateFunction func(initialConfig *kubeletconfig.KubeletConfiguration)) {
 	var oldCfg *kubeletconfig.KubeletConfiguration
+
 	ginkgo.BeforeEach(func() {
-		configEnabled, err := isKubeletConfigEnabled(f)
-		framework.ExpectNoError(err)
-		framework.ExpectEqual(configEnabled, true, "The Dynamic Kubelet Configuration feature is not enabled.\n"+
-			"Pass --feature-gates=DynamicKubeletConfig=true to the Kubelet to enable this feature.\n"+
-			"For `make test-e2e-node`, you can set `TEST_ARGS='--feature-gates=DynamicKubeletConfig=true'`.")
+		var err error
 		oldCfg, err = getCurrentKubeletConfig()
 		framework.ExpectNoError(err)
+
 		newCfg := oldCfg.DeepCopy()
 		updateFunction(newCfg)
 		if apiequality.Semantic.DeepEqual(*newCfg, *oldCfg) {
 			return
 		}
 
-		framework.ExpectNoError(setKubeletConfiguration(f, newCfg))
+		updateKubeletConfig(f, newCfg, true)
 	})
+
 	ginkgo.AfterEach(func() {
 		if oldCfg != nil {
-			err := setKubeletConfiguration(f, oldCfg)
-			framework.ExpectNoError(err)
+			// Update the Kubelet configuration.
+			updateKubeletConfig(f, oldCfg, true)
 		}
 	})
 }
 
-// Returns true if kubeletConfig is enabled, false otherwise or if we cannot determine if it is.
-func isKubeletConfigEnabled(f *framework.Framework) (bool, error) {
-	cfgz, err := getCurrentKubeletConfig()
-	if err != nil {
-		return false, fmt.Errorf("could not determine whether 'DynamicKubeletConfig' feature is enabled, err: %v", err)
+func updateKubeletConfig(f *framework.Framework, kubeletConfig *kubeletconfig.KubeletConfiguration, deleteStateFiles bool) {
+	// Update the Kubelet configuration.
+	ginkgo.By("Stopping the kubelet")
+	startKubelet := stopKubelet()
+
+	// wait until the kubelet health check will fail
+	gomega.Eventually(func() bool {
+		return kubeletHealthCheck(kubeletHealthCheckURL)
+	}, time.Minute, time.Second).Should(gomega.BeFalse())
+
+	// Delete CPU and memory manager state files to be sure it will not prevent the kubelet restart
+	if deleteStateFiles {
+		deleteStateFile(cpuManagerStateFile)
+		deleteStateFile(memoryManagerStateFile)
 	}
-	v, ok := cfgz.FeatureGates[string(features.DynamicKubeletConfig)]
-	if !ok {
-		return true, nil
-	}
-	return v, nil
+
+	framework.ExpectNoError(e2enodekubelet.WriteKubeletConfigFile(kubeletConfig))
+
+	ginkgo.By("Starting the kubelet")
+	startKubelet()
+
+	// wait until the kubelet health check will succeed
+	gomega.Eventually(func() bool {
+		return kubeletHealthCheck(kubeletHealthCheckURL)
+	}, 2*time.Minute, 5*time.Second).Should(gomega.BeTrue())
+
+	// Wait for the Kubelet to be ready.
+	gomega.Eventually(func() bool {
+		nodes, err := e2enode.TotalReady(f.ClientSet)
+		framework.ExpectNoError(err)
+		return nodes == 1
+	}, time.Minute, time.Second).Should(gomega.BeTrue())
 }
 
-// Creates or updates the configmap for KubeletConfiguration, waits for the Kubelet to restart
-// with the new configuration. Returns an error if the configuration after waiting for restartGap
-// doesn't match what you attempted to set, or if the dynamic configuration feature is disabled.
-// You should only call this from serial tests.
-func setKubeletConfiguration(f *framework.Framework, kubeCfg *kubeletconfig.KubeletConfiguration) error {
-	const (
-		restartGap   = 40 * time.Second
-		pollInterval = 5 * time.Second
-	)
-
-	// make sure Dynamic Kubelet Configuration feature is enabled on the Kubelet we are about to reconfigure
-	if configEnabled, err := isKubeletConfigEnabled(f); err != nil {
-		return err
-	} else if !configEnabled {
-		return fmt.Errorf("The Dynamic Kubelet Configuration feature is not enabled.\n" +
-			"Pass --feature-gates=DynamicKubeletConfig=true to the Kubelet to enable this feature.\n" +
-			"For `make test-e2e-node`, you can set `TEST_ARGS='--feature-gates=DynamicKubeletConfig=true'`.")
-	}
-
-	// create the ConfigMap with the new configuration
-	cm, err := createConfigMap(f, kubeCfg)
-	if err != nil {
-		return err
-	}
-
-	// create the reference and set Node.Spec.ConfigSource
-	src := &v1.NodeConfigSource{
-		ConfigMap: &v1.ConfigMapNodeConfigSource{
-			Namespace:        "kube-system",
-			Name:             cm.Name,
-			KubeletConfigKey: "kubelet",
-		},
-	}
-
-	// set the source, retry a few times in case we are competing with other writers
-	gomega.Eventually(func() error {
-		if err := setNodeConfigSource(f, src); err != nil {
-			return err
-		}
-		return nil
-	}, time.Minute, time.Second).Should(gomega.BeNil())
-
-	// poll for new config, for a maximum wait of restartGap
-	gomega.Eventually(func() error {
-		newKubeCfg, err := getCurrentKubeletConfig()
-		if err != nil {
-			return fmt.Errorf("failed trying to get current Kubelet config, will retry, error: %v", err)
-		}
-		if !apiequality.Semantic.DeepEqual(*kubeCfg, *newKubeCfg) {
-			return fmt.Errorf("still waiting for new configuration to take effect, will continue to watch /configz")
-		}
-		klog.Infof("new configuration has taken effect")
-		return nil
-	}, restartGap, pollInterval).Should(gomega.BeNil())
-
-	return nil
-}
-
-// sets the current node's configSource, this should only be called from Serial tests
-func setNodeConfigSource(f *framework.Framework, source *v1.NodeConfigSource) error {
-	// since this is a serial test, we just get the node, change the source, and then update it
-	// this prevents any issues with the patch API from affecting the test results
-	nodeclient := f.ClientSet.CoreV1().Nodes()
-
-	// get the node
-	node, err := nodeclient.Get(context.TODO(), framework.TestContext.NodeName, metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-
-	// set new source
-	node.Spec.ConfigSource = source
-
-	// update to the new source
-	_, err = nodeclient.Update(context.TODO(), node, metav1.UpdateOptions{})
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// creates a configmap containing kubeCfg in kube-system namespace
-func createConfigMap(f *framework.Framework, internalKC *kubeletconfig.KubeletConfiguration) (*v1.ConfigMap, error) {
-	cmap := newKubeletConfigMap("testcfg", internalKC)
-	cmap, err := f.ClientSet.CoreV1().ConfigMaps("kube-system").Create(context.TODO(), cmap, metav1.CreateOptions{})
-	if err != nil {
-		return nil, err
-	}
-	return cmap, nil
-}
-
-// constructs a ConfigMap, populating one of its keys with the KubeletConfiguration. Always uses GenerateName to generate a suffix.
-func newKubeletConfigMap(name string, internalKC *kubeletconfig.KubeletConfiguration) *v1.ConfigMap {
-	data, err := kubeletconfigcodec.EncodeKubeletConfig(internalKC, kubeletconfigv1beta1.SchemeGroupVersion)
-	framework.ExpectNoError(err)
-
-	cmap := &v1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{GenerateName: name + "-"},
-		Data: map[string]string{
-			"kubelet": string(data),
-		},
-	}
-	return cmap
+func deleteStateFile(stateFileName string) {
+	err := exec.Command("/bin/sh", "-c", fmt.Sprintf("rm -f %s", stateFileName)).Run()
+	framework.ExpectNoError(err, "failed to delete the state file")
 }
 
 // listNamespaceEvents lists the events in the given namespace.
@@ -322,24 +267,6 @@ func logKubeletLatencyMetrics(metricNames ...string) {
 	}
 }
 
-// returns config related metrics from the local kubelet, filtered to the filterMetricNames passed in
-func getKubeletMetrics(filterMetricNames sets.String) (e2emetrics.KubeletMetrics, error) {
-	// grab Kubelet metrics
-	ms, err := e2emetrics.GrabKubeletMetricsWithoutProxy(framework.TestContext.NodeName+":10255", "/metrics")
-	if err != nil {
-		return nil, err
-	}
-
-	filtered := e2emetrics.NewKubeletMetrics()
-	for name := range ms {
-		if !filterMetricNames.Has(name) {
-			continue
-		}
-		filtered[name] = ms[name]
-	}
-	return filtered, nil
-}
-
 // runCommand runs the cmd and returns the combined stdout and stderr, or an
 // error if the command failed.
 func runCommand(cmd ...string) (string, error) {
@@ -372,17 +299,94 @@ func getCRIClient() (internalapi.RuntimeService, internalapi.ImageManagerService
 	return r, i, nil
 }
 
+// findKubeletServiceName searches the unit name among the services known to systemd.
+// if the `running` parameter is true, restricts the search among currently running services;
+// otherwise, also stopped, failed, exited (non-running in general) services are also considered.
 // TODO: Find a uniform way to deal with systemctl/initctl/service operations. #34494
-func restartKubelet() {
-	stdout, err := exec.Command("sudo", "systemctl", "list-units", "kubelet*", "--state=running").CombinedOutput()
+func findKubeletServiceName(running bool) string {
+	cmdLine := []string{
+		"systemctl", "list-units", "*kubelet*",
+	}
+	if running {
+		cmdLine = append(cmdLine, "--state=running")
+	}
+	stdout, err := exec.Command("sudo", cmdLine...).CombinedOutput()
 	framework.ExpectNoError(err)
 	regex := regexp.MustCompile("(kubelet-\\w+)")
 	matches := regex.FindStringSubmatch(string(stdout))
-	framework.ExpectNotEqual(len(matches), 0)
-	kube := matches[0]
-	framework.Logf("Get running kubelet with systemctl: %v, %v", string(stdout), kube)
-	stdout, err = exec.Command("sudo", "systemctl", "restart", kube).CombinedOutput()
-	framework.ExpectNoError(err, "Failed to restart kubelet with systemctl: %v, %v", err, stdout)
+	framework.ExpectNotEqual(len(matches), 0, "Found more than one kubelet service running: %q", stdout)
+	kubeletServiceName := matches[0]
+	framework.Logf("Get running kubelet with systemctl: %v, %v", string(stdout), kubeletServiceName)
+	return kubeletServiceName
+}
+
+// restartKubelet restarts the current kubelet service.
+// the "current" kubelet service is the instance managed by the current e2e_node test run.
+// If `running` is true, restarts only if the current kubelet is actually running. In some cases,
+// the kubelet may have exited or can be stopped, typically because it was intentionally stopped
+// earlier during a test, or, sometimes, because it just crashed.
+// Warning: the "current" kubelet is poorly defined. The "current" kubelet is assumed to be the most
+// recent kubelet service unit, IOW there is not a unique ID we use to bind explicitly a kubelet
+// instance to a test run.
+func restartKubelet(running bool) {
+	kubeletServiceName := findKubeletServiceName(running)
+	// reset the kubelet service start-limit-hit
+	stdout, err := exec.Command("sudo", "systemctl", "reset-failed", kubeletServiceName).CombinedOutput()
+	framework.ExpectNoError(err, "Failed to reset kubelet start-limit-hit with systemctl: %v, %s", err, string(stdout))
+
+	stdout, err = exec.Command("sudo", "systemctl", "restart", kubeletServiceName).CombinedOutput()
+	framework.ExpectNoError(err, "Failed to restart kubelet with systemctl: %v, %s", err, string(stdout))
+}
+
+// stopKubelet will kill the running kubelet, and returns a func that will restart the process again
+func stopKubelet() func() {
+	kubeletServiceName := findKubeletServiceName(true)
+
+	// reset the kubelet service start-limit-hit
+	stdout, err := exec.Command("sudo", "systemctl", "reset-failed", kubeletServiceName).CombinedOutput()
+	framework.ExpectNoError(err, "Failed to reset kubelet start-limit-hit with systemctl: %v, %s", err, string(stdout))
+
+	stdout, err = exec.Command("sudo", "systemctl", "kill", kubeletServiceName).CombinedOutput()
+	framework.ExpectNoError(err, "Failed to stop kubelet with systemctl: %v, %s", err, string(stdout))
+
+	return func() {
+		// we should restart service, otherwise the transient service start will fail
+		stdout, err := exec.Command("sudo", "systemctl", "restart", kubeletServiceName).CombinedOutput()
+		framework.ExpectNoError(err, "Failed to restart kubelet with systemctl: %v, %v", err, stdout)
+	}
+}
+
+// killKubelet sends a signal (SIGINT, SIGSTOP, SIGTERM...) to the running kubelet
+func killKubelet(sig string) {
+	kubeletServiceName := findKubeletServiceName(true)
+
+	// reset the kubelet service start-limit-hit
+	stdout, err := exec.Command("sudo", "systemctl", "reset-failed", kubeletServiceName).CombinedOutput()
+	framework.ExpectNoError(err, "Failed to reset kubelet start-limit-hit with systemctl: %v, %v", err, stdout)
+
+	stdout, err = exec.Command("sudo", "systemctl", "kill", "-s", sig, kubeletServiceName).CombinedOutput()
+	framework.ExpectNoError(err, "Failed to stop kubelet with systemctl: %v, %v", err, stdout)
+}
+
+func kubeletHealthCheck(url string) bool {
+	insecureTransport := http.DefaultTransport.(*http.Transport).Clone()
+	insecureTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	insecureHTTPClient := &http.Client{
+		Transport: insecureTransport,
+	}
+
+	req, err := http.NewRequest("HEAD", url, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", framework.TestContext.BearerToken))
+	resp, err := insecureHTTPClient.Do(req)
+	if err != nil {
+		klog.Warningf("Health check on %q failed, error=%v", url, err)
+	} else if resp.StatusCode != http.StatusOK {
+		klog.Warningf("Health check on %q failed, status=%d", url, resp.StatusCode)
+	}
+	return err == nil && resp.StatusCode == http.StatusOK
 }
 
 func toCgroupFsName(cgroupName cm.CgroupName) string {
@@ -392,13 +396,16 @@ func toCgroupFsName(cgroupName cm.CgroupName) string {
 	return cgroupName.ToCgroupfs()
 }
 
-// reduceAllocatableMemoryUsage uses memory.force_empty (https://lwn.net/Articles/432224/)
+// reduceAllocatableMemoryUsageIfCgroupv1 uses memory.force_empty (https://lwn.net/Articles/432224/)
 // to make the kernel reclaim memory in the allocatable cgroup
-// the time to reduce pressure may be unbounded, but usually finishes within a second
-func reduceAllocatableMemoryUsage() {
-	cmd := fmt.Sprintf("echo 0 > /sys/fs/cgroup/memory/%s/memory.force_empty", toCgroupFsName(cm.NewCgroupName(cm.RootCgroupName, defaultNodeAllocatableCgroup)))
-	_, err := exec.Command("sudo", "sh", "-c", cmd).CombinedOutput()
-	framework.ExpectNoError(err)
+// the time to reduce pressure may be unbounded, but usually finishes within a second.
+// memory.force_empty is no supported in cgroupv2.
+func reduceAllocatableMemoryUsageIfCgroupv1() {
+	if !IsCgroup2UnifiedMode() {
+		cmd := fmt.Sprintf("echo 0 > /sys/fs/cgroup/memory/%s/memory.force_empty", toCgroupFsName(cm.NewCgroupName(cm.RootCgroupName, defaultNodeAllocatableCgroup)))
+		_, err := exec.Command("sudo", "sh", "-c", cmd).CombinedOutput()
+		framework.ExpectNoError(err)
+	}
 }
 
 // Equivalent of featuregatetesting.SetFeatureGateDuringTest

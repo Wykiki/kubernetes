@@ -17,39 +17,42 @@ limitations under the License.
 package expand
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"time"
 
 	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
-	"k8s.io/utils/mount"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	coreinformers "k8s.io/client-go/informers/core/v1"
-	storageclassinformer "k8s.io/client-go/informers/storage/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
-	storagelisters "k8s.io/client-go/listers/storage/v1"
 	"k8s.io/client-go/tools/cache"
 	kcache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	cloudprovider "k8s.io/cloud-provider"
-	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	"k8s.io/kubernetes/pkg/controller/volume/events"
+	"k8s.io/kubernetes/pkg/features"
+	proxyutil "k8s.io/kubernetes/pkg/proxy/util"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/csimigration"
 	"k8s.io/kubernetes/pkg/volume/util"
 	"k8s.io/kubernetes/pkg/volume/util/operationexecutor"
 	"k8s.io/kubernetes/pkg/volume/util/subpath"
+	volumetypes "k8s.io/kubernetes/pkg/volume/util/types"
 	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
 )
 
@@ -60,7 +63,7 @@ const (
 
 // ExpandController expands the pvs
 type ExpandController interface {
-	Run(stopCh <-chan struct{})
+	Run(ctx context.Context)
 }
 
 // CSINameTranslator can get the CSI Driver name based on the in-tree plugin name
@@ -82,10 +85,6 @@ type expandController struct {
 	pvLister corelisters.PersistentVolumeLister
 	pvSynced kcache.InformerSynced
 
-	// storageClass lister for fetching provisioner name
-	classLister       storagelisters.StorageClassLister
-	classListerSynced cache.InformerSynced
-
 	// cloud provider used by volume host
 	cloud cloudprovider.Interface
 
@@ -102,6 +101,8 @@ type expandController struct {
 	translator CSINameTranslator
 
 	csiMigratedPluginManager csimigration.PluginManager
+
+	filteredDialOptions *proxyutil.FilteredDialOptions
 }
 
 // NewExpandController expands the pvs
@@ -109,11 +110,11 @@ func NewExpandController(
 	kubeClient clientset.Interface,
 	pvcInformer coreinformers.PersistentVolumeClaimInformer,
 	pvInformer coreinformers.PersistentVolumeInformer,
-	scInformer storageclassinformer.StorageClassInformer,
 	cloud cloudprovider.Interface,
 	plugins []volume.VolumePlugin,
 	translator CSINameTranslator,
-	csiMigratedPluginManager csimigration.PluginManager) (ExpandController, error) {
+	csiMigratedPluginManager csimigration.PluginManager,
+	filteredDialOptions *proxyutil.FilteredDialOptions) (ExpandController, error) {
 
 	expc := &expandController{
 		kubeClient:               kubeClient,
@@ -122,11 +123,10 @@ func NewExpandController(
 		pvcsSynced:               pvcInformer.Informer().HasSynced,
 		pvLister:                 pvInformer.Lister(),
 		pvSynced:                 pvInformer.Informer().HasSynced,
-		classLister:              scInformer.Lister(),
-		classListerSynced:        scInformer.Informer().HasSynced,
 		queue:                    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "volume_expand"),
 		translator:               translator,
 		csiMigratedPluginManager: csiMigratedPluginManager,
+		filteredDialOptions:      filteredDialOptions,
 	}
 
 	if err := expc.volumePluginMgr.InitPlugins(plugins, nil, expc); err != nil {
@@ -134,7 +134,7 @@ func NewExpandController(
 	}
 
 	eventBroadcaster := record.NewBroadcaster()
-	eventBroadcaster.StartLogging(klog.Infof)
+	eventBroadcaster.StartStructuredLogging(0)
 	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
 	expc.recorder = eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "volume_expand"})
 	blkutil := volumepathhandler.NewBlockVolumePathHandler()
@@ -154,13 +154,18 @@ func NewExpandController(
 				return
 			}
 
-			oldSize := oldPVC.Spec.Resources.Requests[v1.ResourceStorage]
+			oldReq := oldPVC.Spec.Resources.Requests[v1.ResourceStorage]
+			oldCap := oldPVC.Status.Capacity[v1.ResourceStorage]
 			newPVC, ok := new.(*v1.PersistentVolumeClaim)
 			if !ok {
 				return
 			}
-			newSize := newPVC.Spec.Resources.Requests[v1.ResourceStorage]
-			if newSize.Cmp(oldSize) > 0 {
+			newReq := newPVC.Spec.Resources.Requests[v1.ResourceStorage]
+			newCap := newPVC.Status.Capacity[v1.ResourceStorage]
+			// PVC will be enqueued under 2 circumstances
+			// 1. User has increased PVC's request capacity --> volume needs to be expanded
+			// 2. PVC status capacity has been expanded --> claim's bound PV has likely recently gone through filesystem resize, so remove AnnPreResizeCapacity annotation from PV
+			if newReq.Cmp(oldReq) > 0 || newCap.Cmp(oldCap) > 0 {
 				expc.enqueuePVC(new)
 			}
 		},
@@ -176,10 +181,7 @@ func (expc *expandController) enqueuePVC(obj interface{}) {
 		return
 	}
 
-	size := pvc.Spec.Resources.Requests[v1.ResourceStorage]
-	statusSize := pvc.Status.Capacity[v1.ResourceStorage]
-
-	if pvc.Status.Phase == v1.ClaimBound && size.Cmp(statusSize) > 0 {
+	if pvc.Status.Phase == v1.ClaimBound {
 		key, err := kcache.DeletionHandlingMetaNamespaceKeyFunc(pvc)
 		if err != nil {
 			runtime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", pvc, err))
@@ -189,14 +191,14 @@ func (expc *expandController) enqueuePVC(obj interface{}) {
 	}
 }
 
-func (expc *expandController) processNextWorkItem() bool {
+func (expc *expandController) processNextWorkItem(ctx context.Context) bool {
 	key, shutdown := expc.queue.Get()
 	if shutdown {
 		return false
 	}
 	defer expc.queue.Done(key)
 
-	err := expc.syncHandler(key.(string))
+	err := expc.syncHandler(ctx, key.(string))
 	if err == nil {
 		expc.queue.Forget(key)
 		return true
@@ -210,7 +212,7 @@ func (expc *expandController) processNextWorkItem() bool {
 
 // syncHandler performs actual expansion of volume. If an error is returned
 // from this function - PVC will be requeued for resizing.
-func (expc *expandController) syncHandler(key string) error {
+func (expc *expandController) syncHandler(ctx context.Context, key string) error {
 	namespace, name, err := kcache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return err
@@ -224,7 +226,7 @@ func (expc *expandController) syncHandler(key string) error {
 		return err
 	}
 
-	pv, err := getPersistentVolume(pvc, expc.pvLister)
+	pv, err := expc.getPersistentVolume(ctx, pvc)
 	if err != nil {
 		klog.V(5).Infof("Error getting Persistent Volume for PVC %q (uid: %q) from informer : %v", util.GetPersistentVolumeClaimQualifiedName(pvc), pvc.UID, err)
 		return err
@@ -236,19 +238,16 @@ func (expc *expandController) syncHandler(key string) error {
 		return err
 	}
 
-	claimClass := v1helper.GetPersistentVolumeClaimClass(pvc)
-	if claimClass == "" {
-		klog.V(4).Infof("volume expansion is disabled for PVC without StorageClasses: %s", util.ClaimToClaimKey(pvc))
+	pvcRequestSize := pvc.Spec.Resources.Requests[v1.ResourceStorage]
+	pvcStatusSize := pvc.Status.Capacity[v1.ResourceStorage]
+
+	// call expand operation only under two condition
+	// 1. pvc's request size has been expanded and is larger than pvc's current status size
+	// 2. pv has an pre-resize capacity annotation
+	if pvcRequestSize.Cmp(pvcStatusSize) <= 0 && !metav1.HasAnnotation(pv.ObjectMeta, util.AnnPreResizeCapacity) {
 		return nil
 	}
 
-	class, err := expc.classLister.Get(claimClass)
-	if err != nil {
-		klog.V(4).Infof("failed to expand PVC: %s with error: %v", util.ClaimToClaimKey(pvc), err)
-		return nil
-	}
-
-	volumeResizerName := class.Provisioner
 	volumeSpec := volume.NewSpecFromPersistentVolume(pv, false)
 	migratable, err := expc.csiMigratedPluginManager.IsMigratable(volumeSpec)
 	if err != nil {
@@ -257,9 +256,15 @@ func (expc *expandController) syncHandler(key string) error {
 	}
 	// handle CSI migration scenarios before invoking FindExpandablePluginBySpec for in-tree
 	if migratable {
-		msg := fmt.Sprintf("CSI migration enabled for %s; waiting for external resizer to expand the pvc", volumeResizerName)
+		inTreePluginName, err := expc.csiMigratedPluginManager.GetInTreePluginNameFromSpec(volumeSpec.PersistentVolume, volumeSpec.Volume)
+		if err != nil {
+			klog.V(4).Infof("Error getting in-tree plugin name from persistent volume %s: %v", volumeSpec.PersistentVolume.Name, err)
+			return err
+		}
+
+		msg := fmt.Sprintf("CSI migration enabled for %s; waiting for external resizer to expand the pvc", inTreePluginName)
 		expc.recorder.Event(pvc, v1.EventTypeNormal, events.ExternalExpanding, msg)
-		csiResizerName, err := expc.translator.GetCSINameFromInTreeName(class.Provisioner)
+		csiResizerName, err := expc.translator.GetCSINameFromInTreeName(inTreePluginName)
 		if err != nil {
 			errorMsg := fmt.Sprintf("error getting CSI driver name for pvc %s, with error %v", util.ClaimToClaimKey(pvc), err)
 			expc.recorder.Event(pvc, v1.EventTypeWarning, events.ExternalExpanding, errorMsg)
@@ -290,60 +295,92 @@ func (expc *expandController) syncHandler(key string) error {
 		return nil
 	}
 
+	volumeResizerName := volumePlugin.GetPluginName()
 	return expc.expand(pvc, pv, volumeResizerName)
 }
 
 func (expc *expandController) expand(pvc *v1.PersistentVolumeClaim, pv *v1.PersistentVolume, resizerName string) error {
-	pvc, err := util.MarkResizeInProgressWithResizer(pvc, resizerName, expc.kubeClient)
-	if err != nil {
-		klog.V(5).Infof("Error setting PVC %s in progress with error : %v", util.GetPersistentVolumeClaimQualifiedName(pvc), err)
-		return err
+	// if node expand is complete and pv's annotation can be removed, remove the annotation from pv and return
+	if expc.isNodeExpandComplete(pvc, pv) && metav1.HasAnnotation(pv.ObjectMeta, util.AnnPreResizeCapacity) {
+		return util.DeleteAnnPreResizeCapacity(pv, expc.GetKubeClient())
 	}
 
-	generatedOperations, err := expc.operationGenerator.GenerateExpandVolumeFunc(pvc, pv)
-	if err != nil {
-		klog.Errorf("Error starting ExpandVolume for pvc %s with %v", util.GetPersistentVolumeClaimQualifiedName(pvc), err)
-		return err
+	var generatedOptions volumetypes.GeneratedOperations
+	var err error
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.RecoverVolumeExpansionFailure) {
+		generatedOptions, err = expc.operationGenerator.GenerateExpandAndRecoverVolumeFunc(pvc, pv, resizerName)
+		if err != nil {
+			klog.Errorf("Error starting ExpandVolume for pvc %s with %v", util.GetPersistentVolumeClaimQualifiedName(pvc), err)
+			return err
+		}
+	} else {
+		pvc, err := util.MarkResizeInProgressWithResizer(pvc, resizerName, expc.kubeClient)
+		if err != nil {
+			klog.Errorf("Error setting PVC %s in progress with error : %v", util.GetPersistentVolumeClaimQualifiedName(pvc), err)
+			return err
+		}
+
+		generatedOptions, err = expc.operationGenerator.GenerateExpandVolumeFunc(pvc, pv)
+		if err != nil {
+			klog.Errorf("Error starting ExpandVolume for pvc %s with %v", util.GetPersistentVolumeClaimQualifiedName(pvc), err)
+			return err
+		}
 	}
+
 	klog.V(5).Infof("Starting ExpandVolume for volume %s", util.GetPersistentVolumeClaimQualifiedName(pvc))
-	_, detailedErr := generatedOperations.Run()
+	_, detailedErr := generatedOptions.Run()
 
 	return detailedErr
 }
 
-// TODO make concurrency configurable (workers/threadiness argument). previously, nestedpendingoperations spawned unlimited goroutines
-func (expc *expandController) Run(stopCh <-chan struct{}) {
+// TODO make concurrency configurable (workers argument). previously, nestedpendingoperations spawned unlimited goroutines
+func (expc *expandController) Run(ctx context.Context) {
 	defer runtime.HandleCrash()
 	defer expc.queue.ShutDown()
 
 	klog.Infof("Starting expand controller")
 	defer klog.Infof("Shutting down expand controller")
 
-	if !cache.WaitForNamedCacheSync("expand", stopCh, expc.pvcsSynced, expc.pvSynced, expc.classListerSynced) {
+	if !cache.WaitForNamedCacheSync("expand", ctx.Done(), expc.pvcsSynced, expc.pvSynced) {
 		return
 	}
 
 	for i := 0; i < defaultWorkerCount; i++ {
-		go wait.Until(expc.runWorker, time.Second, stopCh)
+		go wait.UntilWithContext(ctx, expc.runWorker, time.Second)
 	}
 
-	<-stopCh
+	<-ctx.Done()
 }
 
-func (expc *expandController) runWorker() {
-	for expc.processNextWorkItem() {
+func (expc *expandController) runWorker(ctx context.Context) {
+	for expc.processNextWorkItem(ctx) {
 	}
 }
 
-func getPersistentVolume(pvc *v1.PersistentVolumeClaim, pvLister corelisters.PersistentVolumeLister) (*v1.PersistentVolume, error) {
+func (expc *expandController) getPersistentVolume(ctx context.Context, pvc *v1.PersistentVolumeClaim) (*v1.PersistentVolume, error) {
 	volumeName := pvc.Spec.VolumeName
-	pv, err := pvLister.Get(volumeName)
+	pv, err := expc.kubeClient.CoreV1().PersistentVolumes().Get(ctx, volumeName, metav1.GetOptions{})
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to find PV %q in PV informer cache with error : %v", volumeName, err)
+		return nil, fmt.Errorf("failed to get PV %q: %v", volumeName, err)
 	}
 
 	return pv.DeepCopy(), nil
+}
+
+// isNodeExpandComplete returns true if  pvc.Status.Capacity >= pv.Spec.Capacity
+func (expc *expandController) isNodeExpandComplete(pvc *v1.PersistentVolumeClaim, pv *v1.PersistentVolume) bool {
+	klog.V(4).Infof("pv %q capacity = %v, pvc %s capacity = %v", pv.Name, pv.Spec.Capacity[v1.ResourceStorage], pvc.ObjectMeta.Name, pvc.Status.Capacity[v1.ResourceStorage])
+	pvcSpecCap := pvc.Spec.Resources.Requests.Storage()
+	pvcStatusCap, pvCap := pvc.Status.Capacity[v1.ResourceStorage], pv.Spec.Capacity[v1.ResourceStorage]
+
+	// since we allow shrinking volumes, we must compare both pvc status and capacity
+	// with pv spec capacity.
+	if pvcStatusCap.Cmp(*pvcSpecCap) >= 0 && pvcStatusCap.Cmp(pvCap) >= 0 {
+		return true
+	}
+	return false
 }
 
 // Implementing VolumeHost interface
@@ -419,6 +456,10 @@ func (expc *expandController) GetConfigMapFunc() func(namespace, name string) (*
 	}
 }
 
+func (expc *expandController) GetAttachedVolumesFromNodeStatus() (map[v1.UniqueVolumeName]string, error) {
+	return map[v1.UniqueVolumeName]string{}, nil
+}
+
 func (expc *expandController) GetServiceAccountTokenFunc() func(_, _ string, _ *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 	return func(_, _ string, _ *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 		return nil, fmt.Errorf("GetServiceAccountToken unsupported in expandController")
@@ -446,4 +487,8 @@ func (expc *expandController) GetEventRecorder() record.EventRecorder {
 func (expc *expandController) GetSubpather() subpath.Interface {
 	// not needed for expand controller
 	return nil
+}
+
+func (expc *expandController) GetFilteredDialOptions() *proxyutil.FilteredDialOptions {
+	return expc.filteredDialOptions
 }

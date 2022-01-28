@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"strings"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
@@ -49,7 +49,14 @@ type Interface interface {
 	LoadBalancer() (LoadBalancer, bool)
 	// Instances returns an instances interface. Also returns true if the interface is supported, false otherwise.
 	Instances() (Instances, bool)
+	// InstancesV2 is an implementation for instances and should only be implemented by external cloud providers.
+	// Implementing InstancesV2 is behaviorally identical to Instances but is optimized to significantly reduce
+	// API calls to the cloud provider when registering and syncing nodes. Implementation of this interface will
+	// disable calls to the Zones interface. Also returns true if the interface is supported, false otherwise.
+	InstancesV2() (InstancesV2, bool)
 	// Zones returns a zones interface. Also returns true if the interface is supported, false otherwise.
+	// DEPRECATED: Zones is deprecated in favor of retrieving zone/region information from InstancesV2.
+	// This interface will not be called if InstancesV2 is enabled.
 	Zones() (Zones, bool)
 	// Clusters returns a clusters interface.  Also returns true if the interface is supported, false otherwise.
 	Clusters() (Clusters, bool)
@@ -163,7 +170,6 @@ type Instances interface {
 	// ProviderID is a unique identifier of the node. This will not be called
 	// from the node whose nodeaddresses are being queried. i.e. local metadata
 	// services cannot be used in this method to obtain nodeaddresses
-	// Deprecated: Remove once all calls are migrated to InstanceMetadataByProviderID
 	NodeAddressesByProviderID(ctx context.Context, providerID string) ([]v1.NodeAddress, error)
 	// InstanceID returns the cloud provider ID of the node with the specified NodeName.
 	// Note that if the instance does not exist, we must return ("", cloudprovider.InstanceNotFound)
@@ -172,7 +178,6 @@ type Instances interface {
 	// InstanceType returns the type of the specified instance.
 	InstanceType(ctx context.Context, name types.NodeName) (string, error)
 	// InstanceTypeByProviderID returns the type of the specified instance.
-	// Deprecated: Remove once all calls are migrated to InstanceMetadataByProviderID
 	InstanceTypeByProviderID(ctx context.Context, providerID string) (string, error)
 	// AddSSHKeyToAllInstances adds an SSH public key as a legal identity for all instances
 	// expected format for the key is standard ssh-keygen format: <protocol> <blob>
@@ -183,12 +188,27 @@ type Instances interface {
 	// InstanceExistsByProviderID returns true if the instance for the given provider exists.
 	// If false is returned with no error, the instance will be immediately deleted by the cloud controller manager.
 	// This method should still return true for instances that exist but are stopped/sleeping.
-	// Deprecated: Remove once all calls are migrated to InstanceMetadataByProviderID
 	InstanceExistsByProviderID(ctx context.Context, providerID string) (bool, error)
 	// InstanceShutdownByProviderID returns true if the instance is shutdown in cloudprovider
 	InstanceShutdownByProviderID(ctx context.Context, providerID string) (bool, error)
-	// InstanceMetadataByProviderID returns the instance's metadata.
-	InstanceMetadataByProviderID(ctx context.Context, providerID string) (*InstanceMetadata, error)
+}
+
+// InstancesV2 is an abstract, pluggable interface for cloud provider instances.
+// Unlike the Instances interface, it is designed for external cloud providers and should only be used by them.
+// Implementation of this interface will disable calls to the Zones interface.
+type InstancesV2 interface {
+	// InstanceExists returns true if the instance for the given node exists according to the cloud provider.
+	// Use the node.name or node.spec.providerID field to find the node in the cloud provider.
+	InstanceExists(ctx context.Context, node *v1.Node) (bool, error)
+	// InstanceShutdown returns true if the instance is shutdown according to the cloud provider.
+	// Use the node.name or node.spec.providerID field to find the node in the cloud provider.
+	InstanceShutdown(ctx context.Context, node *v1.Node) (bool, error)
+	// InstanceMetadata returns the instance's metadata. The values returned in InstanceMetadata are
+	// translated into specific fields and labels in the Node object on registration.
+	// Implementations should always check node.spec.providerID first when trying to discover the instance
+	// for a given node. In cases where node.spec.providerID is empty, implementations can use other
+	// properties of the node like its name, labels and annotations.
+	InstanceMetadata(ctx context.Context, node *v1.Node) (*InstanceMetadata, error)
 }
 
 // Route is a representation of an advanced routing rule.
@@ -233,6 +253,8 @@ type Zone struct {
 }
 
 // Zones is an abstract, pluggable interface for zone enumeration.
+// DEPRECATED: Zones is deprecated in favor of retrieving zone/region information from InstancesV2.
+// This interface will not be called if InstancesV2 is enabled.
 type Zones interface {
 	// GetZone returns the Zone containing the current failure zone and locality region that the program is running in
 	// In most cases, this method is called from the kubelet querying a local metadata service to acquire its zone.
@@ -256,12 +278,36 @@ type PVLabeler interface {
 	GetLabelsForVolume(ctx context.Context, pv *v1.PersistentVolume) (map[string]string, error)
 }
 
-// InstanceMetadata contains metadata about the specific instance.
+// InstanceMetadata contains metadata about a specific instance.
+// Values returned in InstanceMetadata are translated into specific fields and labels for Node.
 type InstanceMetadata struct {
-	// ProviderID is provider's id that instance belongs to.
+	// ProviderID is a unique ID used to identify an instance on the cloud provider.
+	// The ProviderID set here will be set on the node's spec.providerID field.
+	// The provider ID format can be set by the cloud provider but providers should
+	// ensure the format does not change in any incompatible way.
+	//
+	// The provider ID format used by existing cloud provider has been:
+	//    <provider-name>://<instance-id>
+	// Existing providers setting this field should preserve the existing format
+	// currently being set in node.spec.providerID.
 	ProviderID string
-	// Type is instance's type.
-	Type string
+	// InstanceType is the instance's type.
+	// The InstanceType set here will be set using the following labels on the node object:
+	//   * node.kubernetes.io/instance-type=<instance-type>
+	//   * beta.kubernetes.io/instance-type=<instance-type> (DEPRECATED)
+	InstanceType string
 	// NodeAddress contains information for the instance's address.
+	// The node addresses returned here will be set on the node's status.addresses field.
 	NodeAddresses []v1.NodeAddress
+
+	// Zone is the zone that the instance is in.
+	// The value set here is applied as the following labels on the node:
+	//   * topology.kubernetes.io/zone=<zone>
+	//   * failure-domain.beta.kubernetes.io/zone=<zone> (DEPRECATED)
+	Zone string
+	// Region is the region that the instance is in.
+	// The value set here is applied as the following labels on the node:
+	//   * topology.kubernetes.io/region=<region>
+	//   * failure-domain.beta.kubernetes.io/region=<region> (DEPRECATED)
+	Region string
 }

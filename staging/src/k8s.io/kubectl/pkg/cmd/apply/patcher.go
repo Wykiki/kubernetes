@@ -25,6 +25,7 @@ import (
 	"github.com/jonboulle/clockwork"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -57,10 +58,10 @@ type Patcher struct {
 	Overwrite bool
 	BackOff   clockwork.Clock
 
-	Force       bool
-	Cascade     bool
-	Timeout     time.Duration
-	GracePeriod int
+	Force             bool
+	CascadingStrategy metav1.DeletionPropagation
+	Timeout           time.Duration
+	GracePeriod       int
 
 	// If set, forces the patch against a specific resourceVersion
 	ResourceVersion *string
@@ -78,21 +79,21 @@ func newPatcher(o *ApplyOptions, info *resource.Info, helper *resource.Helper) (
 	}
 
 	return &Patcher{
-		Mapping:       info.Mapping,
-		Helper:        helper,
-		Overwrite:     o.Overwrite,
-		BackOff:       clockwork.NewRealClock(),
-		Force:         o.DeleteOptions.ForceDeletion,
-		Cascade:       o.DeleteOptions.Cascade,
-		Timeout:       o.DeleteOptions.Timeout,
-		GracePeriod:   o.DeleteOptions.GracePeriod,
-		OpenapiSchema: openapiSchema,
-		Retries:       maxPatchRetry,
+		Mapping:           info.Mapping,
+		Helper:            helper,
+		Overwrite:         o.Overwrite,
+		BackOff:           clockwork.NewRealClock(),
+		Force:             o.DeleteOptions.ForceDeletion,
+		CascadingStrategy: o.DeleteOptions.CascadingStrategy,
+		Timeout:           o.DeleteOptions.Timeout,
+		GracePeriod:       o.DeleteOptions.GracePeriod,
+		OpenapiSchema:     openapiSchema,
+		Retries:           maxPatchRetry,
 	}, nil
 }
 
 func (p *Patcher) delete(namespace, name string) error {
-	options := asDeleteOptions(p.Cascade, p.GracePeriod)
+	options := asDeleteOptions(p.CascadingStrategy, p.GracePeriod)
 	_, err := p.Helper.DeleteWithOptions(namespace, name, &options)
 	return err
 }
@@ -191,7 +192,7 @@ func (p *Patcher) Patch(current runtime.Object, modified []byte, source, namespa
 		if i > triesBeforeBackOff {
 			p.BackOff.Sleep(backOffPeriod)
 		}
-		current, getErr = p.Helper.Get(namespace, name, false)
+		current, getErr = p.Helper.Get(namespace, name)
 		if getErr != nil {
 			return nil, nil, getErr
 		}
@@ -209,7 +210,7 @@ func (p *Patcher) deleteAndCreate(original runtime.Object, modified []byte, name
 	}
 	// TODO: use wait
 	if err := wait.PollImmediate(1*time.Second, p.Timeout, func() (bool, error) {
-		if _, err := p.Helper.Get(namespace, name, false); !errors.IsNotFound(err) {
+		if _, err := p.Helper.Get(namespace, name); !errors.IsNotFound(err) {
 			return false, err
 		}
 		return true, nil

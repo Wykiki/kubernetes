@@ -25,18 +25,13 @@ ABSOLUTE_ROOT=$(readlink -f "${KUBE_ROOT}")
 source "${KUBE_ROOT}/cluster/kubemark/util.sh"
 
 echo "Kubemark master name: ${MASTER_NAME}"
-
-detect-master
+echo "Kubemark master ip: ${KUBE_MASTER_IP}"
 
 export KUBE_MASTER_URL="https://${KUBE_MASTER_IP}"
 export KUBECONFIG="${ABSOLUTE_ROOT}/test/kubemark/resources/kubeconfig.kubemark"
 export E2E_MIN_STARTUP_PODS=0
 
-if [[ -z "$*" ]]; then
-	ARGS=('--ginkgo.focus=[Feature:Performance]')
-else
-	ARGS=("$@")
-fi
+ARGS=("$@")
 
 if [[ "${ENABLE_KUBEMARK_CLUSTER_AUTOSCALER}" == "true" ]]; then
   ARGS+=("--kubemark-external-kubeconfig=${DEFAULT_KUBECONFIG}")

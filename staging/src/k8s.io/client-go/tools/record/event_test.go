@@ -21,18 +21,20 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/client-go/kubernetes/scheme"
 	restclient "k8s.io/client-go/rest"
 	ref "k8s.io/client-go/tools/reference"
+	"k8s.io/utils/clock"
+	testclocks "k8s.io/utils/clock/testing"
 )
 
 type testEventSink struct {
@@ -101,10 +103,32 @@ func OnPatchFactory(testCache map[string]*v1.Event, patchEvent chan<- *v1.Event)
 	}
 }
 
+func TestNonRacyShutdown(t *testing.T) {
+	// Attempt to simulate previously racy conditions, and ensure that no race
+	// occurs: Nominally, calling "Eventf" *followed by* shutdown from the same
+	// thread should be a safe operation, but it's not if we launch recorder.Action
+	// in a goroutine.
+
+	caster := NewBroadcasterForTests(0)
+	clock := testclocks.NewFakeClock(time.Now())
+	recorder := recorderWithFakeClock(v1.EventSource{Component: "eventTest"}, caster, clock)
+
+	var wg sync.WaitGroup
+	wg.Add(100)
+	for i := 0; i < 100; i++ {
+		go func() {
+			defer wg.Done()
+			recorder.Eventf(&v1.ObjectReference{}, v1.EventTypeNormal, "Started", "blah")
+		}()
+	}
+
+	wg.Wait()
+	caster.Shutdown()
+}
+
 func TestEventf(t *testing.T) {
 	testPod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			SelfLink:  "/api/v1/namespaces/baz/pods/foo",
 			Name:      "foo",
 			Namespace: "baz",
 			UID:       "bar",
@@ -112,7 +136,6 @@ func TestEventf(t *testing.T) {
 	}
 	testPod2 := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			SelfLink:  "/api/v1/namespaces/baz/pods/foo",
 			Name:      "foo",
 			Namespace: "baz",
 			UID:       "differentUid",
@@ -349,7 +372,7 @@ func TestEventf(t *testing.T) {
 	eventBroadcaster := NewBroadcasterForTests(0)
 	sinkWatcher := eventBroadcaster.StartRecordingToSink(&testEvents)
 
-	clock := clock.NewFakeClock(time.Now())
+	clock := testclocks.NewFakeClock(time.Now())
 	recorder := recorderWithFakeClock(v1.EventSource{Component: "eventTest"}, eventBroadcaster, clock)
 	for index, item := range table {
 		clock.Step(1 * time.Second)
@@ -414,7 +437,7 @@ func TestWriteEventError(t *testing.T) {
 		},
 	}
 
-	clock := clock.IntervalClock{Time: time.Now(), Duration: time.Second}
+	clock := testclocks.SimpleIntervalClock{Time: time.Now(), Duration: time.Second}
 	eventCorrelator := NewEventCorrelator(&clock)
 
 	for caseName, ent := range table {
@@ -437,7 +460,7 @@ func TestWriteEventError(t *testing.T) {
 }
 
 func TestUpdateExpiredEvent(t *testing.T) {
-	clock := clock.IntervalClock{Time: time.Now(), Duration: time.Second}
+	clock := testclocks.SimpleIntervalClock{Time: time.Now(), Duration: time.Second}
 	eventCorrelator := NewEventCorrelator(&clock)
 
 	var createdEvent *v1.Event
@@ -509,7 +532,7 @@ func TestLotsOfEvents(t *testing.T) {
 			APIVersion: "version",
 		}
 		// we need to vary the reason to prevent aggregation
-		go recorder.Eventf(ref, v1.EventTypeNormal, "Reason-"+string(i), strconv.Itoa(i))
+		go recorder.Eventf(ref, v1.EventTypeNormal, "Reason-"+strconv.Itoa(i), strconv.Itoa(i))
 	}
 	// Make sure no events were dropped by either of the listeners.
 	for i := 0; i < maxQueuedEvents; i++ {
@@ -529,9 +552,8 @@ func TestLotsOfEvents(t *testing.T) {
 func TestEventfNoNamespace(t *testing.T) {
 	testPod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			SelfLink: "/api/v1/namespaces/default/pods/foo",
-			Name:     "foo",
-			UID:      "bar",
+			Name: "foo",
+			UID:  "bar",
 		},
 	}
 	testRef, err := ref.GetPartialReference(scheme.Scheme, testPod, "spec.containers[2]")
@@ -594,7 +616,7 @@ func TestEventfNoNamespace(t *testing.T) {
 	eventBroadcaster := NewBroadcasterForTests(0)
 	sinkWatcher := eventBroadcaster.StartRecordingToSink(&testEvents)
 
-	clock := clock.NewFakeClock(time.Now())
+	clock := testclocks.NewFakeClock(time.Now())
 	recorder := recorderWithFakeClock(v1.EventSource{Component: "eventTest"}, eventBroadcaster, clock)
 
 	for index, item := range table {
@@ -626,7 +648,6 @@ func TestEventfNoNamespace(t *testing.T) {
 func TestMultiSinkCache(t *testing.T) {
 	testPod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			SelfLink:  "/api/v1/namespaces/baz/pods/foo",
 			Name:      "foo",
 			Namespace: "baz",
 			UID:       "bar",
@@ -634,7 +655,6 @@ func TestMultiSinkCache(t *testing.T) {
 	}
 	testPod2 := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			SelfLink:  "/api/v1/namespaces/baz/pods/foo",
 			Name:      "foo",
 			Namespace: "baz",
 			UID:       "differentUid",
@@ -882,7 +902,7 @@ func TestMultiSinkCache(t *testing.T) {
 	}
 
 	eventBroadcaster := NewBroadcasterForTests(0)
-	clock := clock.NewFakeClock(time.Now())
+	clock := testclocks.NewFakeClock(time.Now())
 	recorder := recorderWithFakeClock(v1.EventSource{Component: "eventTest"}, eventBroadcaster, clock)
 
 	sinkWatcher := eventBroadcaster.StartRecordingToSink(&testEvents)

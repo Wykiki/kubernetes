@@ -29,30 +29,27 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	capi "k8s.io/api/certificates/v1beta1"
-	"k8s.io/apimachinery/pkg/util/clock"
+	capi "k8s.io/api/certificates/v1"
 	"k8s.io/apimachinery/pkg/util/diff"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes/fake"
 	testclient "k8s.io/client-go/testing"
 	"k8s.io/client-go/util/cert"
-
-	capihelper "k8s.io/kubernetes/pkg/apis/certificates/v1beta1"
+	"k8s.io/client-go/util/certificate/csr"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	capihelper "k8s.io/kubernetes/pkg/apis/certificates/v1"
+	"k8s.io/kubernetes/pkg/controller/certificates"
+	"k8s.io/kubernetes/pkg/features"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 func TestSigner(t *testing.T) {
-	clock := clock.FakeClock{}
+	fakeClock := testingclock.FakeClock{}
 
-	s, err := newSigner(capi.LegacyUnknownSignerName, "./testdata/ca.crt", "./testdata/ca.key", nil, 1*time.Hour)
+	s, err := newSigner("kubernetes.io/legacy-unknown", "./testdata/ca.crt", "./testdata/ca.key", nil, 1*time.Hour)
 	if err != nil {
 		t.Fatalf("failed to create signer: %v", err)
 	}
-	currCA, err := s.caProvider.currentCA()
-	if err != nil {
-		t.Fatal(err)
-	}
-	currCA.Now = clock.Now
-	currCA.Backdate = 0
-	s.caProvider.caValue.Store(currCA)
 
 	csrb, err := ioutil.ReadFile("./testdata/kubelet.csr")
 	if err != nil {
@@ -68,7 +65,11 @@ func TestSigner(t *testing.T) {
 		capi.UsageKeyEncipherment,
 		capi.UsageServerAuth,
 		capi.UsageClientAuth,
-	})
+	},
+		// requesting a duration that is greater than TTL is ignored
+		csr.DurationToExpirationSeconds(3*time.Hour),
+		fakeClock.Now,
+	)
 	if err != nil {
 		t.Fatalf("failed to sign CSR: %v", err)
 	}
@@ -93,7 +94,8 @@ func TestSigner(t *testing.T) {
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
-		NotAfter:              clock.Now().Add(1 * time.Hour),
+		NotBefore:             fakeClock.Now().Add(-5 * time.Minute),
+		NotAfter:              fakeClock.Now().Add(1 * time.Hour),
 		PublicKeyAlgorithm:    x509.ECDSA,
 		SignatureAlgorithm:    x509.SHA256WithRSA,
 		MaxPathLen:            -1,
@@ -114,6 +116,8 @@ func TestHandle(t *testing.T) {
 		usages     []capi.KeyUsage
 		// whether the generated CSR should be marked as approved
 		approved bool
+		// whether the generated CSR should be marked as failed
+		failed bool
 		// the signerName to be set on the generated CSR
 		signerName string
 		// if true, expect an error to be returned
@@ -149,9 +153,16 @@ func TestHandle(t *testing.T) {
 			usages:     []capi.KeyUsage{capi.UsageServerAuth, capi.UsageClientAuth, capi.UsageDigitalSignature, capi.UsageKeyEncipherment},
 			approved:   true,
 			verify: func(t *testing.T, as []testclient.Action) {
-				if len(as) != 0 {
-					t.Errorf("expected no Update action but got %d", len(as))
+				if len(as) != 1 {
+					t.Errorf("expected one Update action but got %d", len(as))
 					return
+				}
+				csr := as[0].(testclient.UpdateAction).GetObject().(*capi.CertificateSigningRequest)
+				if len(csr.Status.Certificate) != 0 {
+					t.Errorf("expected no certificate to be issued")
+				}
+				if !certificates.HasTrueCondition(csr, capi.CertificateFailed) {
+					t.Errorf("expected Failed condition")
 				}
 			},
 		},
@@ -204,6 +215,21 @@ func TestHandle(t *testing.T) {
 				csr := as[0].(testclient.UpdateAction).GetObject().(*capi.CertificateSigningRequest)
 				if len(csr.Status.Certificate) == 0 {
 					t.Errorf("expected certificate to be issued but it was not")
+				}
+			},
+		},
+		{
+			name:       "should do nothing if failed",
+			signerName: "kubernetes.io/kubelet-serving",
+			commonName: "system:node:testnode",
+			org:        []string{"system:nodes"},
+			usages:     []capi.KeyUsage{capi.UsageServerAuth, capi.UsageDigitalSignature, capi.UsageKeyEncipherment},
+			dnsNames:   []string{"example.com"},
+			approved:   true,
+			failed:     true,
+			verify: func(t *testing.T, as []testclient.Action) {
+				if len(as) != 0 {
+					t.Errorf("expected no action to be taken")
 				}
 			},
 		},
@@ -267,7 +293,7 @@ func TestHandle(t *testing.T) {
 				// continue with rest of test
 			}
 
-			csr := makeTestCSR(csrBuilder{cn: c.commonName, signerName: c.signerName, approved: c.approved, usages: c.usages, org: c.org, dnsNames: c.dnsNames})
+			csr := makeTestCSR(csrBuilder{cn: c.commonName, signerName: c.signerName, approved: c.approved, failed: c.failed, usages: c.usages, org: c.org, dnsNames: c.dnsNames})
 			if err := s.handle(csr); err != nil && !c.err {
 				t.Errorf("unexpected err: %v", err)
 			}
@@ -286,6 +312,7 @@ type csrBuilder struct {
 	org        []string
 	signerName string
 	approved   bool
+	failed     bool
 	usages     []capi.KeyUsage
 }
 
@@ -311,12 +338,105 @@ func makeTestCSR(b csrBuilder) *capi.CertificateSigningRequest {
 		},
 	}
 	if b.signerName != "" {
-		csr.Spec.SignerName = &b.signerName
+		csr.Spec.SignerName = b.signerName
 	}
 	if b.approved {
 		csr.Status.Conditions = append(csr.Status.Conditions, capi.CertificateSigningRequestCondition{
 			Type: capi.CertificateApproved,
 		})
 	}
+	if b.failed {
+		csr.Status.Conditions = append(csr.Status.Conditions, capi.CertificateSigningRequestCondition{
+			Type: capi.CertificateFailed,
+		})
+	}
 	return csr
+}
+
+func Test_signer_duration(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		certTTL           time.Duration
+		expirationSeconds *int32
+		wantGateEnabled   time.Duration
+		wantGateDisabled  time.Duration
+	}{
+		{
+			name:              "can request shorter duration than TTL",
+			certTTL:           time.Hour,
+			expirationSeconds: csr.DurationToExpirationSeconds(30 * time.Minute),
+			wantGateEnabled:   30 * time.Minute,
+			wantGateDisabled:  time.Hour,
+		},
+		{
+			name:              "cannot request longer duration than TTL",
+			certTTL:           time.Hour,
+			expirationSeconds: csr.DurationToExpirationSeconds(3 * time.Hour),
+			wantGateEnabled:   time.Hour,
+			wantGateDisabled:  time.Hour,
+		},
+		{
+			name:              "cannot request negative duration",
+			certTTL:           time.Hour,
+			expirationSeconds: csr.DurationToExpirationSeconds(-time.Minute),
+			wantGateEnabled:   10 * time.Minute,
+			wantGateDisabled:  time.Hour,
+		},
+		{
+			name:              "cannot request duration less than 10 mins",
+			certTTL:           time.Hour,
+			expirationSeconds: csr.DurationToExpirationSeconds(10*time.Minute - time.Second),
+			wantGateEnabled:   10 * time.Minute,
+			wantGateDisabled:  time.Hour,
+		},
+		{
+			name:              "can request duration of exactly 10 mins",
+			certTTL:           time.Hour,
+			expirationSeconds: csr.DurationToExpirationSeconds(10 * time.Minute),
+			wantGateEnabled:   10 * time.Minute,
+			wantGateDisabled:  time.Hour,
+		},
+		{
+			name:              "can request duration equal to the default",
+			certTTL:           time.Hour,
+			expirationSeconds: csr.DurationToExpirationSeconds(time.Hour),
+			wantGateEnabled:   time.Hour,
+			wantGateDisabled:  time.Hour,
+		},
+		{
+			name:              "can choose not to request a duration to get the default",
+			certTTL:           time.Hour,
+			expirationSeconds: nil,
+			wantGateEnabled:   time.Hour,
+			wantGateDisabled:  time.Hour,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+
+		f := func(t *testing.T, want time.Duration) {
+			s := &signer{
+				certTTL: tt.certTTL,
+			}
+			if got := s.duration(tt.expirationSeconds); got != want {
+				t.Errorf("duration() = %v, want %v", got, want)
+			}
+		}
+
+		// regular tests
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel() // these are safe to run in parallel but not the feature gate disabled tests
+
+			f(t, tt.wantGateEnabled)
+		})
+
+		// same tests with the feature gate disabled
+		t.Run("feature gate disabled - "+tt.name, func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSRDuration, false)()
+			f(t, tt.wantGateDisabled)
+		})
+
+	}
 }

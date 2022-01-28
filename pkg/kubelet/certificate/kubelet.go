@@ -26,24 +26,26 @@ import (
 	"sort"
 	"time"
 
-	certificates "k8s.io/api/certificates/v1beta1"
+	certificates "k8s.io/api/certificates/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clientset "k8s.io/client-go/kubernetes"
-	certificatesclient "k8s.io/client-go/kubernetes/typed/certificates/v1beta1"
 	"k8s.io/client-go/util/certificate"
 	compbasemetrics "k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
+	netutils "k8s.io/utils/net"
 )
 
 // NewKubeletServerCertificateManager creates a certificate manager for the kubelet when retrieving a server certificate
 // or returns an error.
 func NewKubeletServerCertificateManager(kubeClient clientset.Interface, kubeCfg *kubeletconfig.KubeletConfiguration, nodeName types.NodeName, getAddresses func() []v1.NodeAddress, certDirectory string) (certificate.Manager, error) {
-	var certSigningRequestClient certificatesclient.CertificateSigningRequestInterface
-	if kubeClient != nil && kubeClient.CertificatesV1beta1() != nil {
-		certSigningRequestClient = kubeClient.CertificatesV1beta1().CertificateSigningRequests()
+	var clientsetFn certificate.ClientsetFunc
+	if kubeClient != nil {
+		clientsetFn = func(current *tls.Certificate) (clientset.Interface, error) {
+			return kubeClient, nil
+		}
 	}
 	certificateStore, err := certificate.NewFileStore(
 		"kubelet-server",
@@ -103,9 +105,7 @@ func NewKubeletServerCertificateManager(kubeClient clientset.Interface, kubeCfg 
 	}
 
 	m, err := certificate.NewManager(&certificate.Config{
-		ClientFn: func(current *tls.Certificate) (certificatesclient.CertificateSigningRequestInterface, error) {
-			return certSigningRequestClient, nil
-		},
+		ClientsetFn: clientsetFn,
 		GetTemplate: getTemplate,
 		SignerName:  certificates.KubeletServingSignerName,
 		Usages: []certificates.KeyUsage{
@@ -142,7 +142,7 @@ func NewKubeletServerCertificateManager(kubeClient clientset.Interface, kubeCfg 
 		},
 		func() float64 {
 			if c := m.Current(); c != nil && c.Leaf != nil {
-				return math.Trunc(c.Leaf.NotAfter.Sub(time.Now()).Seconds())
+				return math.Trunc(time.Until(c.Leaf.NotAfter).Seconds())
 			}
 			return math.Inf(1)
 		},
@@ -160,13 +160,13 @@ func addressesToHostnamesAndIPs(addresses []v1.NodeAddress) (dnsNames []string, 
 
 		switch address.Type {
 		case v1.NodeHostName:
-			if ip := net.ParseIP(address.Address); ip != nil {
+			if ip := netutils.ParseIPSloppy(address.Address); ip != nil {
 				seenIPs[address.Address] = true
 			} else {
 				seenDNSNames[address.Address] = true
 			}
 		case v1.NodeExternalIP, v1.NodeInternalIP:
-			if ip := net.ParseIP(address.Address); ip != nil {
+			if ip := netutils.ParseIPSloppy(address.Address); ip != nil {
 				seenIPs[address.Address] = true
 			}
 		case v1.NodeExternalDNS, v1.NodeInternalDNS:
@@ -178,7 +178,7 @@ func addressesToHostnamesAndIPs(addresses []v1.NodeAddress) (dnsNames []string, 
 		dnsNames = append(dnsNames, dnsName)
 	}
 	for ip := range seenIPs {
-		ips = append(ips, net.ParseIP(ip))
+		ips = append(ips, netutils.ParseIPSloppy(ip))
 	}
 
 	// return in stable order
@@ -198,7 +198,7 @@ func NewKubeletClientCertificateManager(
 	bootstrapKeyData []byte,
 	certFile string,
 	keyFile string,
-	clientFn certificate.CSRClientFunc,
+	clientsetFn certificate.ClientsetFunc,
 ) (certificate.Manager, error) {
 
 	certificateStore, err := certificate.NewFileStore(
@@ -222,7 +222,7 @@ func NewKubeletClientCertificateManager(
 	legacyregistry.Register(certificateRenewFailure)
 
 	m, err := certificate.NewManager(&certificate.Config{
-		ClientFn: clientFn,
+		ClientsetFn: clientsetFn,
 		Template: &x509.CertificateRequest{
 			Subject: pkix.Name{
 				CommonName:   fmt.Sprintf("system:node:%s", nodeName),

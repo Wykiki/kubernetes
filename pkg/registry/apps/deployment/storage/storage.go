@@ -25,12 +25,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/endpoints/handlers/fieldmanager"
+	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage"
 	storeerr "k8s.io/apiserver/pkg/storage/errors"
 	"k8s.io/apiserver/pkg/util/dryrun"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/apis/apps"
 	appsv1beta1 "k8s.io/kubernetes/pkg/apis/apps/v1beta1"
 	appsv1beta2 "k8s.io/kubernetes/pkg/apis/apps/v1beta2"
@@ -43,6 +46,7 @@ import (
 	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
 	printerstorage "k8s.io/kubernetes/pkg/printers/storage"
 	"k8s.io/kubernetes/pkg/registry/apps/deployment"
+	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 // DeploymentStorage includes dummy storage for Deployments and for Scale subresource.
@@ -51,6 +55,18 @@ type DeploymentStorage struct {
 	Status     *StatusREST
 	Scale      *ScaleREST
 	Rollback   *RollbackREST
+}
+
+// ReplicasPathMappings returns the mappings between each group version and a replicas path
+func ReplicasPathMappings() fieldmanager.ResourcePathMappings {
+	return replicasPathInDeployment
+}
+
+// maps a group version to the replicas path in a deployment object
+var replicasPathInDeployment = fieldmanager.ResourcePathMappings{
+	schema.GroupVersion{Group: "apps", Version: "v1beta1"}.String(): fieldpath.MakePathOrDie("spec", "replicas"),
+	schema.GroupVersion{Group: "apps", Version: "v1beta2"}.String(): fieldpath.MakePathOrDie("spec", "replicas"),
+	schema.GroupVersion{Group: "apps", Version: "v1"}.String():      fieldpath.MakePathOrDie("spec", "replicas"),
 }
 
 // NewStorage returns new instance of DeploymentStorage.
@@ -81,9 +97,10 @@ func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, *Rollbac
 		NewListFunc:              func() runtime.Object { return &apps.DeploymentList{} },
 		DefaultQualifiedResource: apps.Resource("deployments"),
 
-		CreateStrategy: deployment.Strategy,
-		UpdateStrategy: deployment.Strategy,
-		DeleteStrategy: deployment.Strategy,
+		CreateStrategy:      deployment.Strategy,
+		UpdateStrategy:      deployment.Strategy,
+		DeleteStrategy:      deployment.Strategy,
+		ResetFieldsStrategy: deployment.Strategy,
 
 		TableConvertor: printerstorage.TableConvertor{TableGenerator: printers.NewTableGenerator().With(printersinternal.AddHandlers)},
 	}
@@ -94,6 +111,7 @@ func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, *Rollbac
 
 	statusStore := *store
 	statusStore.UpdateStrategy = deployment.StatusStrategy
+	statusStore.ResetFieldsStrategy = deployment.StatusStrategy
 	return &REST{store, []string{"all"}}, &StatusREST{store: &statusStore}, &RollbackREST{store: store}, nil
 }
 
@@ -139,6 +157,11 @@ func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.Updat
 	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
 	// subresources should never allow create on update.
 	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
+}
+
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
 }
 
 // RollbackREST implements the REST endpoint for initiating the rollback of a deployment
@@ -231,7 +254,7 @@ func (r *RollbackREST) setDeploymentRollback(ctx context.Context, deploymentID s
 		d.Spec.RollbackTo = config
 		finalDeployment = d
 		return d, nil
-	}), dryRun)
+	}), dryRun, nil)
 	return finalDeployment, err
 }
 
@@ -279,39 +302,10 @@ func (r *ScaleREST) Get(ctx context.Context, name string, options *metav1.GetOpt
 
 // Update alters scale subset of Deployment object.
 func (r *ScaleREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
-	obj, err := r.store.Get(ctx, name, &metav1.GetOptions{})
-	if err != nil {
-		return nil, false, errors.NewNotFound(apps.Resource("deployments/scale"), name)
-	}
-	deployment := obj.(*apps.Deployment)
-
-	oldScale, err := scaleFromDeployment(deployment)
-	if err != nil {
-		return nil, false, err
-	}
-
-	obj, err = objInfo.UpdatedObject(ctx, oldScale)
-	if err != nil {
-		return nil, false, err
-	}
-	if obj == nil {
-		return nil, false, errors.NewBadRequest(fmt.Sprintf("nil update passed to Scale"))
-	}
-	scale, ok := obj.(*autoscaling.Scale)
-	if !ok {
-		return nil, false, errors.NewBadRequest(fmt.Sprintf("expected input object type to be Scale, but %T", obj))
-	}
-
-	if errs := autoscalingvalidation.ValidateScale(scale); len(errs) > 0 {
-		return nil, false, errors.NewInvalid(autoscaling.Kind("Scale"), name, errs)
-	}
-
-	deployment.Spec.Replicas = scale.Spec.Replicas
-	deployment.ResourceVersion = scale.ResourceVersion
-	obj, _, err = r.store.Update(
+	obj, _, err := r.store.Update(
 		ctx,
-		deployment.Name,
-		rest.DefaultUpdatedObjectInfo(deployment),
+		name,
+		&scaleUpdatedObjectInfo{name, objInfo},
 		toScaleCreateValidation(createValidation),
 		toScaleUpdateValidation(updateValidation),
 		false,
@@ -320,7 +314,7 @@ func (r *ScaleREST) Update(ctx context.Context, name string, objInfo rest.Update
 	if err != nil {
 		return nil, false, err
 	}
-	deployment = obj.(*apps.Deployment)
+	deployment := obj.(*apps.Deployment)
 	newScale, err := scaleFromDeployment(deployment)
 	if err != nil {
 		return nil, false, errors.NewBadRequest(fmt.Sprintf("%v", err))
@@ -358,6 +352,7 @@ func scaleFromDeployment(deployment *apps.Deployment) (*autoscaling.Scale, error
 	if err != nil {
 		return nil, err
 	}
+
 	return &autoscaling.Scale{
 		// TODO: Create a variant of ObjectMeta type that only contains the fields below.
 		ObjectMeta: metav1.ObjectMeta{
@@ -375,4 +370,91 @@ func scaleFromDeployment(deployment *apps.Deployment) (*autoscaling.Scale, error
 			Selector: selector.String(),
 		},
 	}, nil
+}
+
+// scaleUpdatedObjectInfo transforms existing deployment -> existing scale -> new scale -> new deployment
+type scaleUpdatedObjectInfo struct {
+	name       string
+	reqObjInfo rest.UpdatedObjectInfo
+}
+
+func (i *scaleUpdatedObjectInfo) Preconditions() *metav1.Preconditions {
+	return i.reqObjInfo.Preconditions()
+}
+
+func (i *scaleUpdatedObjectInfo) UpdatedObject(ctx context.Context, oldObj runtime.Object) (runtime.Object, error) {
+	deployment, ok := oldObj.DeepCopyObject().(*apps.Deployment)
+	if !ok {
+		return nil, errors.NewBadRequest(fmt.Sprintf("expected existing object type to be Deployment, got %T", deployment))
+	}
+	// if zero-value, the existing object does not exist
+	if len(deployment.ResourceVersion) == 0 {
+		return nil, errors.NewNotFound(apps.Resource("deployments/scale"), i.name)
+	}
+
+	groupVersion := schema.GroupVersion{Group: "apps", Version: "v1"}
+	if requestInfo, found := genericapirequest.RequestInfoFrom(ctx); found {
+		requestGroupVersion := schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
+		if _, ok := replicasPathInDeployment[requestGroupVersion.String()]; ok {
+			groupVersion = requestGroupVersion
+		} else {
+			klog.Fatal("Unrecognized group/version in request info %q", requestGroupVersion.String())
+		}
+	}
+
+	managedFieldsHandler := fieldmanager.NewScaleHandler(
+		deployment.ManagedFields,
+		groupVersion,
+		replicasPathInDeployment,
+	)
+
+	// deployment -> old scale
+	oldScale, err := scaleFromDeployment(deployment)
+	if err != nil {
+		return nil, err
+	}
+	scaleManagedFields, err := managedFieldsHandler.ToSubresource()
+	if err != nil {
+		return nil, err
+	}
+	oldScale.ManagedFields = scaleManagedFields
+
+	// old scale -> new scale
+	newScaleObj, err := i.reqObjInfo.UpdatedObject(ctx, oldScale)
+	if err != nil {
+		return nil, err
+	}
+	if newScaleObj == nil {
+		return nil, errors.NewBadRequest("nil update passed to Scale")
+	}
+	scale, ok := newScaleObj.(*autoscaling.Scale)
+	if !ok {
+		return nil, errors.NewBadRequest(fmt.Sprintf("expected input object type to be Scale, but %T", newScaleObj))
+	}
+
+	// validate
+	if errs := autoscalingvalidation.ValidateScale(scale); len(errs) > 0 {
+		return nil, errors.NewInvalid(autoscaling.Kind("Scale"), deployment.Name, errs)
+	}
+
+	// validate precondition if specified (resourceVersion matching is handled by storage)
+	if len(scale.UID) > 0 && scale.UID != deployment.UID {
+		return nil, errors.NewConflict(
+			apps.Resource("deployments/scale"),
+			deployment.Name,
+			fmt.Errorf("Precondition failed: UID in precondition: %v, UID in object meta: %v", scale.UID, deployment.UID),
+		)
+	}
+
+	// move replicas/resourceVersion fields to object and return
+	deployment.Spec.Replicas = scale.Spec.Replicas
+	deployment.ResourceVersion = scale.ResourceVersion
+
+	updatedEntries, err := managedFieldsHandler.ToParent(scale.ManagedFields)
+	if err != nil {
+		return nil, err
+	}
+	deployment.ManagedFields = updatedEntries
+
+	return deployment, nil
 }

@@ -19,8 +19,6 @@ package apiclient
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"time"
 
 	"github.com/pkg/errors"
 
@@ -34,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	clientsetretry "k8s.io/client-go/util/retry"
+
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
@@ -62,12 +61,7 @@ func CreateOrUpdateConfigMap(client clientset.Interface, cm *v1.ConfigMap) error
 // taking place)
 func CreateOrMutateConfigMap(client clientset.Interface, cm *v1.ConfigMap, mutator ConfigMapMutator) error {
 	var lastError error
-	err := wait.ExponentialBackoff(wait.Backoff{
-		Steps:    20,
-		Duration: 500 * time.Millisecond,
-		Factor:   1.0,
-		Jitter:   0.1,
-	}, func() (bool, error) {
+	err := wait.PollImmediate(constants.APICallRetryInterval, constants.APICallWithWriteTimeout, func() (bool, error) {
 		if _, err := client.CoreV1().ConfigMaps(cm.ObjectMeta.Namespace).Create(context.TODO(), cm, metav1.CreateOptions{}); err != nil {
 			lastError = err
 			if apierrors.IsAlreadyExists(err) {
@@ -89,22 +83,24 @@ func CreateOrMutateConfigMap(client clientset.Interface, cm *v1.ConfigMap, mutat
 // to conflicts, and a retry will be issued if the ConfigMap was modified on the server between the refresh and the update (while the mutation was
 // taking place).
 func MutateConfigMap(client clientset.Interface, meta metav1.ObjectMeta, mutator ConfigMapMutator) error {
-	return clientsetretry.RetryOnConflict(wait.Backoff{
-		Steps:    20,
-		Duration: 500 * time.Millisecond,
-		Factor:   1.0,
-		Jitter:   0.1,
-	}, func() error {
+	var lastError error
+	err := wait.PollImmediate(constants.APICallRetryInterval, constants.APICallWithWriteTimeout, func() (bool, error) {
 		configMap, err := client.CoreV1().ConfigMaps(meta.Namespace).Get(context.TODO(), meta.Name, metav1.GetOptions{})
 		if err != nil {
-			return err
+			lastError = err
+			return false, nil
 		}
 		if err = mutator(configMap); err != nil {
-			return errors.Wrap(err, "unable to mutate ConfigMap")
+			lastError = errors.Wrap(err, "unable to mutate ConfigMap")
+			return false, nil
 		}
-		_, err = client.CoreV1().ConfigMaps(configMap.ObjectMeta.Namespace).Update(context.TODO(), configMap, metav1.UpdateOptions{})
-		return err
+		_, lastError = client.CoreV1().ConfigMaps(configMap.ObjectMeta.Namespace).Update(context.TODO(), configMap, metav1.UpdateOptions{})
+		return lastError == nil, nil
 	})
+	if err == nil {
+		return nil
+	}
+	return lastError
 }
 
 // CreateOrRetainConfigMap creates a ConfigMap if the target resource doesn't exist. If the resource exists already, this function will retain the resource instead.
@@ -205,30 +201,48 @@ func DeleteDeploymentForeground(client clientset.Interface, namespace, name stri
 
 // CreateOrUpdateRole creates a Role if the target resource doesn't exist. If the resource exists already, this function will update the resource instead.
 func CreateOrUpdateRole(client clientset.Interface, role *rbac.Role) error {
-	if _, err := client.RbacV1().Roles(role.ObjectMeta.Namespace).Create(context.TODO(), role, metav1.CreateOptions{}); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return errors.Wrap(err, "unable to create RBAC role")
-		}
+	var lastError error
+	err := wait.PollImmediate(constants.APICallRetryInterval, constants.APICallWithWriteTimeout, func() (bool, error) {
+		if _, err := client.RbacV1().Roles(role.ObjectMeta.Namespace).Create(context.TODO(), role, metav1.CreateOptions{}); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				lastError = errors.Wrap(err, "unable to create RBAC role")
+				return false, nil
+			}
 
-		if _, err := client.RbacV1().Roles(role.ObjectMeta.Namespace).Update(context.TODO(), role, metav1.UpdateOptions{}); err != nil {
-			return errors.Wrap(err, "unable to update RBAC role")
+			if _, err := client.RbacV1().Roles(role.ObjectMeta.Namespace).Update(context.TODO(), role, metav1.UpdateOptions{}); err != nil {
+				lastError = errors.Wrap(err, "unable to update RBAC role")
+				return false, nil
+			}
 		}
+		return true, nil
+	})
+	if err == nil {
+		return nil
 	}
-	return nil
+	return lastError
 }
 
 // CreateOrUpdateRoleBinding creates a RoleBinding if the target resource doesn't exist. If the resource exists already, this function will update the resource instead.
 func CreateOrUpdateRoleBinding(client clientset.Interface, roleBinding *rbac.RoleBinding) error {
-	if _, err := client.RbacV1().RoleBindings(roleBinding.ObjectMeta.Namespace).Create(context.TODO(), roleBinding, metav1.CreateOptions{}); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return errors.Wrap(err, "unable to create RBAC rolebinding")
-		}
+	var lastError error
+	err := wait.PollImmediate(constants.APICallRetryInterval, constants.APICallWithWriteTimeout, func() (bool, error) {
+		if _, err := client.RbacV1().RoleBindings(roleBinding.ObjectMeta.Namespace).Create(context.TODO(), roleBinding, metav1.CreateOptions{}); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				lastError = errors.Wrap(err, "unable to create RBAC rolebinding")
+				return false, nil
+			}
 
-		if _, err := client.RbacV1().RoleBindings(roleBinding.ObjectMeta.Namespace).Update(context.TODO(), roleBinding, metav1.UpdateOptions{}); err != nil {
-			return errors.Wrap(err, "unable to update RBAC rolebinding")
+			if _, err := client.RbacV1().RoleBindings(roleBinding.ObjectMeta.Namespace).Update(context.TODO(), roleBinding, metav1.UpdateOptions{}); err != nil {
+				lastError = errors.Wrap(err, "unable to update RBAC rolebinding")
+				return false, nil
+			}
 		}
+		return true, nil
+	})
+	if err == nil {
+		return nil
 	}
-	return nil
+	return lastError
 }
 
 // CreateOrUpdateClusterRole creates a ClusterRole if the target resource doesn't exist. If the resource exists already, this function will update the resource instead.
@@ -263,13 +277,13 @@ func CreateOrUpdateClusterRoleBinding(client clientset.Interface, clusterRoleBin
 // This is a condition function meant to be used with wait.Poll. false, nil
 // implies it is safe to try again, an error indicates no more tries should be
 // made and true indicates success.
-func PatchNodeOnce(client clientset.Interface, nodeName string, patchFn func(*v1.Node)) func() (bool, error) {
+func PatchNodeOnce(client clientset.Interface, nodeName string, patchFn func(*v1.Node), lastError *error) func() (bool, error) {
 	return func() (bool, error) {
 		// First get the node object
 		n, err := client.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
 		if err != nil {
-			// TODO this should only be for timeouts
-			return false, nil
+			*lastError = err
+			return false, nil // retry on any error
 		}
 
 		// The node may appear to have no labels at first,
@@ -280,7 +294,8 @@ func PatchNodeOnce(client clientset.Interface, nodeName string, patchFn func(*v1
 
 		oldData, err := json.Marshal(n)
 		if err != nil {
-			return false, errors.Wrapf(err, "failed to marshal unmodified node %q into JSON", n.Name)
+			*lastError = errors.Wrapf(err, "failed to marshal unmodified node %q into JSON", n.Name)
+			return false, *lastError
 		}
 
 		// Execute the mutating function
@@ -288,21 +303,22 @@ func PatchNodeOnce(client clientset.Interface, nodeName string, patchFn func(*v1
 
 		newData, err := json.Marshal(n)
 		if err != nil {
-			return false, errors.Wrapf(err, "failed to marshal modified node %q into JSON", n.Name)
+			*lastError = errors.Wrapf(err, "failed to marshal modified node %q into JSON", n.Name)
+			return false, *lastError
 		}
 
 		patchBytes, err := strategicpatch.CreateTwoWayMergePatch(oldData, newData, v1.Node{})
 		if err != nil {
-			return false, errors.Wrap(err, "failed to create two way merge patch")
+			*lastError = errors.Wrap(err, "failed to create two way merge patch")
+			return false, *lastError
 		}
 
 		if _, err := client.CoreV1().Nodes().Patch(context.TODO(), n.Name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{}); err != nil {
-			// TODO also check for timeouts
-			if apierrors.IsConflict(err) {
-				fmt.Println("Temporarily unable to update node metadata due to conflict (will retry)")
+			*lastError = errors.Wrapf(err, "error patching node %q through apiserver", n.Name)
+			if apierrors.IsTimeout(err) || apierrors.IsConflict(err) {
 				return false, nil
 			}
-			return false, errors.Wrapf(err, "error patching node %q through apiserver", n.Name)
+			return false, *lastError
 		}
 
 		return true, nil
@@ -312,10 +328,15 @@ func PatchNodeOnce(client clientset.Interface, nodeName string, patchFn func(*v1
 // PatchNode tries to patch a node using patchFn for the actual mutating logic.
 // Retries are provided by the wait package.
 func PatchNode(client clientset.Interface, nodeName string, patchFn func(*v1.Node)) error {
+	var lastError error
 	// wait.Poll will rerun the condition function every interval function if
 	// the function returns false. If the condition function returns an error
 	// then the retries end and the error is returned.
-	return wait.Poll(constants.APICallRetryInterval, constants.PatchNodeTimeout, PatchNodeOnce(client, nodeName, patchFn))
+	err := wait.Poll(constants.APICallRetryInterval, constants.PatchNodeTimeout, PatchNodeOnce(client, nodeName, patchFn, &lastError))
+	if err == nil {
+		return nil
+	}
+	return lastError
 }
 
 // GetConfigMapWithRetry tries to retrieve a ConfigMap using the given client,

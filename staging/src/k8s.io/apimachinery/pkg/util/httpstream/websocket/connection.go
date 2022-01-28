@@ -50,6 +50,7 @@ func (connection *Connection) CreateStream(headers http.Header) (httpstream.Stre
 // CreateStream creates a stream by the channel id
 func (connection *Connection) CreateStrean(channelID int) (httpstream.Stream, error) {
 	newStream := &Stream{}
+	return newStream, nil
 }
 
 // Close does nothing as httpstream.Stream is a SPDY function, not a websocket concept

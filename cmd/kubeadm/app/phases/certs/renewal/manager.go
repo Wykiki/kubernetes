@@ -21,8 +21,9 @@ import (
 	"sort"
 
 	"github.com/pkg/errors"
-	clientset "k8s.io/client-go/kubernetes"
+
 	certutil "k8s.io/client-go/util/cert"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	certsphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
@@ -165,6 +166,7 @@ func NewManager(cfg *kubeadmapi.ClusterConfiguration, kubernetesDir string) (*Ma
 			LongName:   kubeConfig.longName,
 			FileName:   kubeConfig.fileName,
 			CABaseName: kubeadmconstants.CACertAndKeyBaseName, // all certificates in kubeConfig files are signed by the Kubernetes CA
+			CAName:     kubeadmconstants.CACertAndKeyBaseName,
 			readwriter: kubeConfigReadWriter,
 		}
 	}
@@ -248,43 +250,6 @@ func (rm *Manager) RenewUsingLocalCA(name string) (bool, error) {
 	}
 
 	return true, nil
-}
-
-// RenewUsingCSRAPI executes certificate renewal uses the K8s certificate API.
-// For PKI certificates, use the name defined in the certsphase package, while for certificates
-// embedded in the kubeConfig files, use the kubeConfig file name defined in the kubeadm constants package.
-// If you use the CertificateRenewHandler returned by Certificates func, handler.Name already contains the right value.
-func (rm *Manager) RenewUsingCSRAPI(name string, client clientset.Interface) error {
-	handler, ok := rm.certificates[name]
-	if !ok {
-		return errors.Errorf("%s is not a valid certificate for this cluster", name)
-	}
-
-	// reads the current certificate
-	cert, err := handler.readwriter.Read()
-	if err != nil {
-		return err
-	}
-
-	// extract the certificate config
-	cfg := &pkiutil.CertConfig{
-		Config:             certToConfig(cert),
-		PublicKeyAlgorithm: rm.cfg.PublicKeyAlgorithm(),
-	}
-
-	// create a new certificate with the same config
-	newCert, newKey, err := NewAPIRenewer(client).Renew(cfg)
-	if err != nil {
-		return errors.Wrapf(err, "failed to renew certificate %s", name)
-	}
-
-	// writes the new certificate to disk
-	err = handler.readwriter.Write(newCert, newKey)
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // CreateRenewCSR generates CSR request for certificate renewal.
@@ -410,7 +375,11 @@ func (rm *Manager) IsExternallyManaged(caBaseName string) (bool, error) {
 		}
 		return externallyManaged, nil
 	case kubeadmconstants.EtcdCACertAndKeyBaseName:
-		return false, nil
+		externallyManaged, err := certsphase.UsingExternalEtcdCA(rm.cfg)
+		if err != nil {
+			return false, errors.Wrapf(err, "Error checking external CA condition for %s certificate authority", caBaseName)
+		}
+		return externallyManaged, nil
 	default:
 		return false, errors.Errorf("unknown certificate authority %s", caBaseName)
 	}

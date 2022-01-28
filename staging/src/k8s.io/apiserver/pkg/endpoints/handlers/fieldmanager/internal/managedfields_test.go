@@ -27,6 +27,129 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+// TestHasFieldsType makes sure that we fail if we don't have a
+// FieldsType set properly.
+func TestHasFieldsType(t *testing.T) {
+	var unmarshaled []metav1.ManagedFieldsEntry
+	if err := yaml.Unmarshal([]byte(`- apiVersion: v1
+  fieldsType: FieldsV1
+  fieldsV1:
+    f:field: {}
+  manager: foo
+  operation: Apply
+`), &unmarshaled); err != nil {
+		t.Fatalf("did not expect yaml unmarshalling error but got: %v", err)
+	}
+	if _, err := DecodeManagedFields(unmarshaled); err != nil {
+		t.Fatalf("did not expect decoding error but got: %v", err)
+	}
+
+	// Invalid fieldsType V2.
+	if err := yaml.Unmarshal([]byte(`- apiVersion: v1
+  fieldsType: FieldsV2
+  fieldsV1:
+    f:field: {}
+  manager: foo
+  operation: Apply
+`), &unmarshaled); err != nil {
+		t.Fatalf("did not expect yaml unmarshalling error but got: %v", err)
+	}
+	if _, err := DecodeManagedFields(unmarshaled); err == nil {
+		t.Fatal("Expect decoding error but got none")
+	}
+
+	// Missing fieldsType.
+	if err := yaml.Unmarshal([]byte(`- apiVersion: v1
+  fieldsV1:
+    f:field: {}
+  manager: foo
+  operation: Apply
+`), &unmarshaled); err != nil {
+		t.Fatalf("did not expect yaml unmarshalling error but got: %v", err)
+	}
+	if _, err := DecodeManagedFields(unmarshaled); err == nil {
+		t.Fatal("Expect decoding error but got none")
+	}
+}
+
+// TestHasAPIVersion makes sure that we fail if we don't have an
+// APIVersion set.
+func TestHasAPIVersion(t *testing.T) {
+	var unmarshaled []metav1.ManagedFieldsEntry
+	if err := yaml.Unmarshal([]byte(`- apiVersion: v1
+  fieldsType: FieldsV1
+  fieldsV1:
+    f:field: {}
+  manager: foo
+  operation: Apply
+`), &unmarshaled); err != nil {
+		t.Fatalf("did not expect yaml unmarshalling error but got: %v", err)
+	}
+	if _, err := DecodeManagedFields(unmarshaled); err != nil {
+		t.Fatalf("did not expect decoding error but got: %v", err)
+	}
+
+	// Missing apiVersion.
+	unmarshaled = nil
+	if err := yaml.Unmarshal([]byte(`- fieldsType: FieldsV1
+  fieldsV1:
+    f:field: {}
+  manager: foo
+  operation: Apply
+`), &unmarshaled); err != nil {
+		t.Fatalf("did not expect yaml unmarshalling error but got: %v", err)
+	}
+	if _, err := DecodeManagedFields(unmarshaled); err == nil {
+		t.Fatal("Expect decoding error but got none")
+	}
+}
+
+// TestHasOperation makes sure that we fail if we don't have an
+// Operation set properly.
+func TestHasOperation(t *testing.T) {
+	var unmarshaled []metav1.ManagedFieldsEntry
+	if err := yaml.Unmarshal([]byte(`- apiVersion: v1
+  fieldsType: FieldsV1
+  fieldsV1:
+    f:field: {}
+  manager: foo
+  operation: Apply
+`), &unmarshaled); err != nil {
+		t.Fatalf("did not expect yaml unmarshalling error but got: %v", err)
+	}
+	if _, err := DecodeManagedFields(unmarshaled); err != nil {
+		t.Fatalf("did not expect decoding error but got: %v", err)
+	}
+
+	// Invalid operation.
+	if err := yaml.Unmarshal([]byte(`- apiVersion: v1
+  fieldsType: FieldsV1
+  fieldsV1:
+    f:field: {}
+  manager: foo
+  operation: Invalid
+`), &unmarshaled); err != nil {
+		t.Fatalf("did not expect yaml unmarshalling error but got: %v", err)
+	}
+	if _, err := DecodeManagedFields(unmarshaled); err == nil {
+		t.Fatal("Expect decoding error but got none")
+	}
+
+	// Missing operation.
+	unmarshaled = nil
+	if err := yaml.Unmarshal([]byte(`- apiVersion: v1
+  fieldsType: FieldsV1
+  fieldsV1:
+    f:field: {}
+  manager: foo
+`), &unmarshaled); err != nil {
+		t.Fatalf("did not expect yaml unmarshalling error but got: %v", err)
+	}
+	if _, err := DecodeManagedFields(unmarshaled); err == nil {
+		t.Fatal("Expect decoding error but got none")
+	}
+}
+
 // TestRoundTripManagedFields will roundtrip ManagedFields from the wire format
 // (api format) to the format used by sigs.k8s.io/structured-merge-diff and back
 func TestRoundTripManagedFields(t *testing.T) {
@@ -136,6 +259,15 @@ func TestRoundTripManagedFields(t *testing.T) {
   manager: foo
   operation: Update
 `,
+		`- apiVersion: v1
+  fieldsType: FieldsV1
+  fieldsV1:
+    f:spec:
+      f:replicas: {}
+  manager: foo
+  operation: Update
+  subresource: scale
+`,
 	}
 
 	for _, test := range tests {
@@ -144,11 +276,11 @@ func TestRoundTripManagedFields(t *testing.T) {
 			if err := yaml.Unmarshal([]byte(test), &unmarshaled); err != nil {
 				t.Fatalf("did not expect yaml unmarshalling error but got: %v", err)
 			}
-			decoded, err := decodeManagedFields(unmarshaled)
+			decoded, err := DecodeManagedFields(unmarshaled)
 			if err != nil {
 				t.Fatalf("did not expect decoding error but got: %v", err)
 			}
-			encoded, err := encodeManagedFields(&decoded)
+			encoded, err := encodeManagedFields(decoded)
 			if err != nil {
 				t.Fatalf("did not expect encoding error but got: %v", err)
 			}
@@ -189,6 +321,18 @@ operation: Apply
 time: "2001-02-03T04:05:06Z"
 `,
 			expected: "{\"manager\":\"foo\",\"operation\":\"Apply\"}",
+		},
+		{
+			managedFieldsEntry: `
+apiVersion: v1
+fieldsV1:
+  f:apiVersion: {}
+manager: foo
+operation: Apply
+subresource: scale
+time: "2001-02-03T04:05:06Z"
+`,
+			expected: "{\"manager\":\"foo\",\"operation\":\"Apply\",\"subresource\":\"scale\"}",
 		},
 	}
 
@@ -337,6 +481,19 @@ func TestSortEncodedManagedFields(t *testing.T) {
 				{Manager: "a", Operation: metav1.ManagedFieldsOperationUpdate, Time: &metav1.Time{time.Date(2000, time.January, 0, 0, 0, 0, 2, time.UTC)}},
 				{Manager: "b", Operation: metav1.ManagedFieldsOperationUpdate, Time: &metav1.Time{time.Date(2000, time.January, 0, 0, 0, 0, 3, time.UTC)}},
 				{Manager: "c", Operation: metav1.ManagedFieldsOperationUpdate, Time: &metav1.Time{time.Date(2000, time.January, 0, 0, 0, 0, 1, time.UTC)}},
+			},
+		},
+		{
+			name: "entries with subresource field",
+			managedFields: []metav1.ManagedFieldsEntry{
+				{Manager: "a", Operation: metav1.ManagedFieldsOperationApply, Subresource: "status"},
+				{Manager: "a", Operation: metav1.ManagedFieldsOperationApply, Subresource: "scale"},
+				{Manager: "a", Operation: metav1.ManagedFieldsOperationApply},
+			},
+			expected: []metav1.ManagedFieldsEntry{
+				{Manager: "a", Operation: metav1.ManagedFieldsOperationApply},
+				{Manager: "a", Operation: metav1.ManagedFieldsOperationApply, Subresource: "scale"},
+				{Manager: "a", Operation: metav1.ManagedFieldsOperationApply, Subresource: "status"},
 			},
 		},
 	}

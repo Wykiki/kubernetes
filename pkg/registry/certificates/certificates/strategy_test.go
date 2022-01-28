@@ -20,19 +20,26 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apiserver/pkg/authentication/user"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	certapi "k8s.io/kubernetes/pkg/apis/certificates"
+	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/utils/pointer"
 )
 
 func TestStrategyCreate(t *testing.T) {
 	tests := map[string]struct {
-		ctx         context.Context
-		obj         runtime.Object
-		expectedObj runtime.Object
+		ctx                context.Context
+		disableFeatureGate bool
+		obj                runtime.Object
+		expectedObj        runtime.Object
 	}{
 		"no user in context, no user in obj": {
 			ctx: genericapirequest.NewContext(),
@@ -110,14 +117,138 @@ func TestStrategyCreate(t *testing.T) {
 			},
 			expectedObj: &certapi.CertificateSigningRequest{
 				Status: certapi.CertificateSigningRequestStatus{Conditions: []certapi.CertificateSigningRequestCondition{}},
-			}},
+			},
+		},
+		"expirationSeconds set with gate enabled": {
+			ctx: genericapirequest.NewContext(),
+			obj: &certapi.CertificateSigningRequest{
+				Spec: certapi.CertificateSigningRequestSpec{
+					ExpirationSeconds: pointer.Int32(1234),
+				},
+			},
+			expectedObj: &certapi.CertificateSigningRequest{
+				Spec: certapi.CertificateSigningRequestSpec{
+					ExpirationSeconds: pointer.Int32(1234),
+				},
+				Status: certapi.CertificateSigningRequestStatus{Conditions: []certapi.CertificateSigningRequestCondition{}},
+			},
+		},
+		"expirationSeconds set with gate disabled": {
+			ctx:                genericapirequest.NewContext(),
+			disableFeatureGate: true,
+			obj: &certapi.CertificateSigningRequest{
+				Spec: certapi.CertificateSigningRequestSpec{
+					ExpirationSeconds: pointer.Int32(5678),
+				},
+			},
+			expectedObj: &certapi.CertificateSigningRequest{
+				Spec: certapi.CertificateSigningRequestSpec{
+					ExpirationSeconds: nil,
+				},
+				Status: certapi.CertificateSigningRequestStatus{Conditions: []certapi.CertificateSigningRequestCondition{}},
+			},
+		},
 	}
 
 	for k, tc := range tests {
-		obj := tc.obj
-		Strategy.PrepareForCreate(tc.ctx, obj)
-		if !reflect.DeepEqual(obj, tc.expectedObj) {
-			t.Errorf("%s: object diff: %s", k, diff.ObjectDiff(obj, tc.expectedObj))
-		}
+		tc := tc
+		t.Run(k, func(t *testing.T) {
+			if tc.disableFeatureGate {
+				defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSRDuration, false)()
+			}
+			obj := tc.obj
+			Strategy.PrepareForCreate(tc.ctx, obj)
+			if !reflect.DeepEqual(obj, tc.expectedObj) {
+				t.Errorf("object diff: %s", diff.ObjectDiff(obj, tc.expectedObj))
+			}
+		})
+	}
+}
+
+func TestStatusUpdate(t *testing.T) {
+	now := metav1.Now()
+	later := metav1.NewTime(now.Add(time.Hour))
+	nowFunc = func() metav1.Time { return now }
+	defer func() {
+		nowFunc = metav1.Now
+	}()
+
+	tests := []struct {
+		name        string
+		newObj      *certapi.CertificateSigningRequest
+		oldObj      *certapi.CertificateSigningRequest
+		expectedObj *certapi.CertificateSigningRequest
+	}{
+		{
+			name:        "no-op",
+			newObj:      &certapi.CertificateSigningRequest{},
+			oldObj:      &certapi.CertificateSigningRequest{},
+			expectedObj: &certapi.CertificateSigningRequest{},
+		},
+		{
+			name: "adding failed condition to existing approved/denied conditions",
+			newObj: &certapi.CertificateSigningRequest{
+				Status: certapi.CertificateSigningRequestStatus{
+					Conditions: []certapi.CertificateSigningRequestCondition{
+						{Type: certapi.CertificateFailed},
+						{Type: certapi.CertificateDenied},
+						{Type: certapi.CertificateApproved},
+						{Type: certapi.CertificateDenied},
+						{Type: certapi.CertificateApproved},
+					},
+				},
+			},
+			oldObj: &certapi.CertificateSigningRequest{
+				Status: certapi.CertificateSigningRequestStatus{
+					Conditions: []certapi.CertificateSigningRequestCondition{
+						{Type: certapi.CertificateDenied, Reason: "because1"},
+						{Type: certapi.CertificateApproved, Reason: "because2"},
+						{Type: certapi.CertificateDenied, Reason: "because3", LastUpdateTime: later, LastTransitionTime: later},
+						{Type: certapi.CertificateApproved, Reason: "because4", LastUpdateTime: later, LastTransitionTime: later},
+					},
+				},
+			},
+			expectedObj: &certapi.CertificateSigningRequest{
+				// preserve existing Approved/Denied conditions
+				Status: certapi.CertificateSigningRequestStatus{
+					Conditions: []certapi.CertificateSigningRequestCondition{
+						{Type: certapi.CertificateFailed, LastUpdateTime: now, LastTransitionTime: now},
+						{Type: certapi.CertificateDenied, LastUpdateTime: now, LastTransitionTime: later, Reason: "because1"},
+						{Type: certapi.CertificateApproved, LastUpdateTime: now, LastTransitionTime: later, Reason: "because2"},
+						{Type: certapi.CertificateDenied, LastUpdateTime: later, LastTransitionTime: later, Reason: "because3"},
+						{Type: certapi.CertificateApproved, LastUpdateTime: later, LastTransitionTime: later, Reason: "because4"},
+					},
+				},
+			},
+		},
+		{
+			name: "add approved condition",
+			newObj: &certapi.CertificateSigningRequest{
+				Status: certapi.CertificateSigningRequestStatus{
+					Conditions: []certapi.CertificateSigningRequestCondition{
+						{Type: certapi.CertificateApproved},
+					},
+				},
+			},
+			oldObj: &certapi.CertificateSigningRequest{},
+			expectedObj: &certapi.CertificateSigningRequest{
+				// preserved submitted conditions if existing Approved/Denied conditions could not be copied over (will fail validation)
+				Status: certapi.CertificateSigningRequestStatus{
+					Conditions: []certapi.CertificateSigningRequestCondition{
+						{Type: certapi.CertificateApproved, LastUpdateTime: now, LastTransitionTime: now},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := tt.newObj.DeepCopy()
+			StatusStrategy.PrepareForUpdate(context.TODO(), obj, tt.oldObj.DeepCopy())
+			if !reflect.DeepEqual(obj, tt.expectedObj) {
+				t.Errorf("object diff: %s", diff.ObjectDiff(obj, tt.expectedObj))
+			}
+		})
 	}
 }

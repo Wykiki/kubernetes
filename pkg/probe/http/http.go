@@ -70,6 +70,7 @@ type httpProber struct {
 
 // Probe returns a ProbeRunner capable of running an HTTP check.
 func (pr httpProber) Probe(url *url.URL, headers http.Header, timeout time.Duration) (probe.Result, string, error) {
+	pr.transport.DisableCompression = true // removes Accept-Encoding header
 	client := &http.Client{
 		Timeout:       timeout,
 		Transport:     pr.transport,
@@ -93,18 +94,23 @@ func DoHTTPProbe(url *url.URL, headers http.Header, client GetHTTPInterface) (pr
 		// Convert errors into failures to catch timeouts.
 		return probe.Failure, err.Error(), nil
 	}
+	if headers == nil {
+		headers = http.Header{}
+	}
 	if _, ok := headers["User-Agent"]; !ok {
-		if headers == nil {
-			headers = http.Header{}
-		}
 		// explicitly set User-Agent so it's not set to default Go value
 		v := version.Get()
 		headers.Set("User-Agent", fmt.Sprintf("kube-probe/%s.%s", v.Major, v.Minor))
 	}
-	req.Header = headers
-	if headers.Get("Host") != "" {
-		req.Host = headers.Get("Host")
+	if _, ok := headers["Accept"]; !ok {
+		// Accept header was not defined. accept all
+		headers.Set("Accept", "*/*")
+	} else if headers.Get("Accept") == "" {
+		// Accept header was overridden but is empty. removing
+		headers.Del("Accept")
 	}
+	req.Header = headers
+	req.Host = headers.Get("Host")
 	res, err := client.Do(req)
 	if err != nil {
 		// Convert errors into failures to catch timeouts.
@@ -123,7 +129,7 @@ func DoHTTPProbe(url *url.URL, headers http.Header, client GetHTTPInterface) (pr
 	if res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusBadRequest {
 		if res.StatusCode >= http.StatusMultipleChoices { // Redirect
 			klog.V(4).Infof("Probe terminated redirects for %s, Response: %v", url.String(), *res)
-			return probe.Warning, body, nil
+			return probe.Warning, fmt.Sprintf("Probe terminated redirects, Response body: %v", body), nil
 		}
 		klog.V(4).Infof("Probe succeeded for %s, Response: %v", url.String(), *res)
 		return probe.Success, body, nil

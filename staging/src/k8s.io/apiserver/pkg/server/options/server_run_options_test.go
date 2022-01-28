@@ -17,12 +17,12 @@ limitations under the License.
 package options
 
 import (
-	"net"
 	"strings"
 	"testing"
 	"time"
 
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	netutils "k8s.io/utils/net"
 )
 
 func TestServerRunOptionsValidate(t *testing.T) {
@@ -32,24 +32,9 @@ func TestServerRunOptionsValidate(t *testing.T) {
 		expectErr   string
 	}{
 		{
-			name: "Test when TargetRAMMB is negative value",
-			testOptions: &ServerRunOptions{
-				AdvertiseAddress:            net.ParseIP("192.168.10.10"),
-				CorsAllowedOriginList:       []string{"10.10.10.100", "10.10.10.200"},
-				MaxRequestsInFlight:         400,
-				MaxMutatingRequestsInFlight: 200,
-				RequestTimeout:              time.Duration(2) * time.Minute,
-				MinRequestTimeout:           1800,
-				JSONPatchMaxCopyBytes:       10 * 1024 * 1024,
-				MaxRequestBodyBytes:         10 * 1024 * 1024,
-				TargetRAMMB:                 -65536,
-			},
-			expectErr: "--target-ram-mb can not be negative value",
-		},
-		{
 			name: "Test when MaxRequestsInFlight is negative value",
 			testOptions: &ServerRunOptions{
-				AdvertiseAddress:            net.ParseIP("192.168.10.10"),
+				AdvertiseAddress:            netutils.ParseIPSloppy("192.168.10.10"),
 				CorsAllowedOriginList:       []string{"10.10.10.100", "10.10.10.200"},
 				MaxRequestsInFlight:         -400,
 				MaxMutatingRequestsInFlight: 200,
@@ -57,14 +42,13 @@ func TestServerRunOptionsValidate(t *testing.T) {
 				MinRequestTimeout:           1800,
 				JSONPatchMaxCopyBytes:       10 * 1024 * 1024,
 				MaxRequestBodyBytes:         10 * 1024 * 1024,
-				TargetRAMMB:                 65536,
 			},
 			expectErr: "--max-requests-inflight can not be negative value",
 		},
 		{
 			name: "Test when MaxMutatingRequestsInFlight is negative value",
 			testOptions: &ServerRunOptions{
-				AdvertiseAddress:            net.ParseIP("192.168.10.10"),
+				AdvertiseAddress:            netutils.ParseIPSloppy("192.168.10.10"),
 				CorsAllowedOriginList:       []string{"10.10.10.100", "10.10.10.200"},
 				MaxRequestsInFlight:         400,
 				MaxMutatingRequestsInFlight: -200,
@@ -72,14 +56,13 @@ func TestServerRunOptionsValidate(t *testing.T) {
 				MinRequestTimeout:           1800,
 				JSONPatchMaxCopyBytes:       10 * 1024 * 1024,
 				MaxRequestBodyBytes:         10 * 1024 * 1024,
-				TargetRAMMB:                 65536,
 			},
 			expectErr: "--max-mutating-requests-inflight can not be negative value",
 		},
 		{
 			name: "Test when RequestTimeout is negative value",
 			testOptions: &ServerRunOptions{
-				AdvertiseAddress:            net.ParseIP("192.168.10.10"),
+				AdvertiseAddress:            netutils.ParseIPSloppy("192.168.10.10"),
 				CorsAllowedOriginList:       []string{"10.10.10.100", "10.10.10.200"},
 				MaxRequestsInFlight:         400,
 				MaxMutatingRequestsInFlight: 200,
@@ -87,14 +70,13 @@ func TestServerRunOptionsValidate(t *testing.T) {
 				MinRequestTimeout:           1800,
 				JSONPatchMaxCopyBytes:       10 * 1024 * 1024,
 				MaxRequestBodyBytes:         10 * 1024 * 1024,
-				TargetRAMMB:                 65536,
 			},
 			expectErr: "--request-timeout can not be negative value",
 		},
 		{
 			name: "Test when MinRequestTimeout is negative value",
 			testOptions: &ServerRunOptions{
-				AdvertiseAddress:            net.ParseIP("192.168.10.10"),
+				AdvertiseAddress:            netutils.ParseIPSloppy("192.168.10.10"),
 				CorsAllowedOriginList:       []string{"10.10.10.100", "10.10.10.200"},
 				MaxRequestsInFlight:         400,
 				MaxMutatingRequestsInFlight: 200,
@@ -102,14 +84,13 @@ func TestServerRunOptionsValidate(t *testing.T) {
 				MinRequestTimeout:           -1800,
 				JSONPatchMaxCopyBytes:       10 * 1024 * 1024,
 				MaxRequestBodyBytes:         10 * 1024 * 1024,
-				TargetRAMMB:                 65536,
 			},
 			expectErr: "--min-request-timeout can not be negative value",
 		},
 		{
 			name: "Test when JSONPatchMaxCopyBytes is negative value",
 			testOptions: &ServerRunOptions{
-				AdvertiseAddress:            net.ParseIP("192.168.10.10"),
+				AdvertiseAddress:            netutils.ParseIPSloppy("192.168.10.10"),
 				CorsAllowedOriginList:       []string{"10.10.10.100", "10.10.10.200"},
 				MaxRequestsInFlight:         400,
 				MaxMutatingRequestsInFlight: 200,
@@ -117,14 +98,13 @@ func TestServerRunOptionsValidate(t *testing.T) {
 				MinRequestTimeout:           1800,
 				JSONPatchMaxCopyBytes:       -10 * 1024 * 1024,
 				MaxRequestBodyBytes:         10 * 1024 * 1024,
-				TargetRAMMB:                 65536,
 			},
-			expectErr: "--json-patch-max-copy-bytes can not be negative value",
+			expectErr: "ServerRunOptions.JSONPatchMaxCopyBytes can not be negative value",
 		},
 		{
 			name: "Test when MaxRequestBodyBytes is negative value",
 			testOptions: &ServerRunOptions{
-				AdvertiseAddress:            net.ParseIP("192.168.10.10"),
+				AdvertiseAddress:            netutils.ParseIPSloppy("192.168.10.10"),
 				CorsAllowedOriginList:       []string{"10.10.10.100", "10.10.10.200"},
 				MaxRequestsInFlight:         400,
 				MaxMutatingRequestsInFlight: 200,
@@ -132,14 +112,13 @@ func TestServerRunOptionsValidate(t *testing.T) {
 				MinRequestTimeout:           1800,
 				JSONPatchMaxCopyBytes:       10 * 1024 * 1024,
 				MaxRequestBodyBytes:         -10 * 1024 * 1024,
-				TargetRAMMB:                 65536,
 			},
-			expectErr: "--max-resource-write-bytes can not be negative value",
+			expectErr: "ServerRunOptions.MaxRequestBodyBytes can not be negative value",
 		},
 		{
 			name: "Test when LivezGracePeriod is negative value",
 			testOptions: &ServerRunOptions{
-				AdvertiseAddress:            net.ParseIP("192.168.10.10"),
+				AdvertiseAddress:            netutils.ParseIPSloppy("192.168.10.10"),
 				CorsAllowedOriginList:       []string{"10.10.10.100", "10.10.10.200"},
 				MaxRequestsInFlight:         400,
 				MaxMutatingRequestsInFlight: 200,
@@ -147,7 +126,6 @@ func TestServerRunOptionsValidate(t *testing.T) {
 				MinRequestTimeout:           1800,
 				JSONPatchMaxCopyBytes:       10 * 1024 * 1024,
 				MaxRequestBodyBytes:         10 * 1024 * 1024,
-				TargetRAMMB:                 65536,
 				LivezGracePeriod:            -time.Second,
 			},
 			expectErr: "--livez-grace-period can not be a negative value",
@@ -155,7 +133,7 @@ func TestServerRunOptionsValidate(t *testing.T) {
 		{
 			name: "Test when MinimalShutdownDuration is negative value",
 			testOptions: &ServerRunOptions{
-				AdvertiseAddress:            net.ParseIP("192.168.10.10"),
+				AdvertiseAddress:            netutils.ParseIPSloppy("192.168.10.10"),
 				CorsAllowedOriginList:       []string{"10.10.10.100", "10.10.10.200"},
 				MaxRequestsInFlight:         400,
 				MaxMutatingRequestsInFlight: 200,
@@ -163,23 +141,37 @@ func TestServerRunOptionsValidate(t *testing.T) {
 				MinRequestTimeout:           1800,
 				JSONPatchMaxCopyBytes:       10 * 1024 * 1024,
 				MaxRequestBodyBytes:         10 * 1024 * 1024,
-				TargetRAMMB:                 65536,
 				ShutdownDelayDuration:       -time.Second,
 			},
 			expectErr: "--shutdown-delay-duration can not be negative value",
 		},
 		{
-			name: "Test when ServerRunOptions is valid",
+			name: "Test when HSTSHeaders is valid",
 			testOptions: &ServerRunOptions{
-				AdvertiseAddress:            net.ParseIP("192.168.10.10"),
+				AdvertiseAddress:            netutils.ParseIPSloppy("192.168.10.10"),
 				CorsAllowedOriginList:       []string{"10.10.10.100", "10.10.10.200"},
+				HSTSDirectives:              []string{"fakevalue", "includeSubDomains", "preload"},
 				MaxRequestsInFlight:         400,
 				MaxMutatingRequestsInFlight: 200,
 				RequestTimeout:              time.Duration(2) * time.Minute,
 				MinRequestTimeout:           1800,
 				JSONPatchMaxCopyBytes:       10 * 1024 * 1024,
 				MaxRequestBodyBytes:         10 * 1024 * 1024,
-				TargetRAMMB:                 65536,
+			},
+			expectErr: "--strict-transport-security-directives invalid, allowed values: max-age=expireTime, includeSubDomains, preload. see https://tools.ietf.org/html/rfc6797#section-6.1 for more information",
+		},
+		{
+			name: "Test when ServerRunOptions is valid",
+			testOptions: &ServerRunOptions{
+				AdvertiseAddress:            netutils.ParseIPSloppy("192.168.10.10"),
+				CorsAllowedOriginList:       []string{"10.10.10.100", "10.10.10.200"},
+				HSTSDirectives:              []string{"max-age=31536000", "includeSubDomains", "preload"},
+				MaxRequestsInFlight:         400,
+				MaxMutatingRequestsInFlight: 200,
+				RequestTimeout:              time.Duration(2) * time.Minute,
+				MinRequestTimeout:           1800,
+				JSONPatchMaxCopyBytes:       10 * 1024 * 1024,
+				MaxRequestBodyBytes:         10 * 1024 * 1024,
 			},
 		},
 	}

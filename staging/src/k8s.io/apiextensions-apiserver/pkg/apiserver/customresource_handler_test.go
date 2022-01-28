@@ -25,6 +25,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -55,6 +57,7 @@ import (
 	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
 	"k8s.io/apiserver/pkg/util/webhook"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/kube-openapi/pkg/validation/spec"
 )
 
 func TestConvertFieldLabel(t *testing.T) {
@@ -148,15 +151,25 @@ func TestRouting(t *testing.T) {
 	crdIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 	crdLister := listers.NewCustomResourceDefinitionLister(crdIndexer)
 
+	// note that in production we delegate to the special handler that is attached at the end of the delegation chain that checks if the server has installed all known HTTP paths before replying to the client.
+	// it returns 503 if not all registered signals have been ready (closed) otherwise it simply replies with 404.
+	// the apiextentionserver is considered to be initialized once hasCRDInformerSyncedSignal is closed.
+	//
+	// here, in this test the delegate represent the special handler and hasSync represents the signal.
+	// primarily we just want to make sure that the delegate has been called.
+	// the behaviour of the real delegate is tested elsewhere.
 	delegateCalled := false
 	delegate := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		delegateCalled = true
+		if !hasSynced {
+			http.Error(w, "", 503)
+			return
+		}
 		http.Error(w, "", 418)
 	})
 	customV1 := schema.GroupVersion{Group: "custom", Version: "v1"}
 	handler := &crdHandler{
 		crdLister: crdLister,
-		hasSynced: func() bool { return hasSynced },
 		delegate:  delegate,
 		versionDiscoveryHandler: &versionDiscoveryHandler{
 			discovery: map[schema.GroupVersion]*discovery.APIVersionHandler{
@@ -206,7 +219,7 @@ func TestRouting(t *testing.T) {
 			HasSynced:            false,
 			IsResourceRequest:    false,
 			ExpectDelegateCalled: false,
-			ExpectStatus:         503,
+			ExpectStatus:         200,
 		},
 		{
 			Name:                 "existing group discovery",
@@ -228,7 +241,7 @@ func TestRouting(t *testing.T) {
 			APIVersion:           "",
 			HasSynced:            false,
 			IsResourceRequest:    false,
-			ExpectDelegateCalled: false,
+			ExpectDelegateCalled: true,
 			ExpectStatus:         503,
 		},
 		{
@@ -252,7 +265,7 @@ func TestRouting(t *testing.T) {
 			HasSynced:            false,
 			IsResourceRequest:    false,
 			ExpectDelegateCalled: false,
-			ExpectStatus:         503,
+			ExpectStatus:         200,
 		},
 		{
 			Name:                 "existing group version discovery",
@@ -274,7 +287,7 @@ func TestRouting(t *testing.T) {
 			APIVersion:           "v1",
 			HasSynced:            false,
 			IsResourceRequest:    false,
-			ExpectDelegateCalled: false,
+			ExpectDelegateCalled: true,
 			ExpectStatus:         503,
 		},
 		{
@@ -297,7 +310,7 @@ func TestRouting(t *testing.T) {
 			APIVersion:           "v2",
 			HasSynced:            false,
 			IsResourceRequest:    false,
-			ExpectDelegateCalled: false,
+			ExpectDelegateCalled: true,
 			ExpectStatus:         503,
 		},
 		{
@@ -322,7 +335,7 @@ func TestRouting(t *testing.T) {
 			Resource:             "foos",
 			HasSynced:            false,
 			IsResourceRequest:    true,
-			ExpectDelegateCalled: false,
+			ExpectDelegateCalled: true,
 			ExpectStatus:         503,
 		},
 		{
@@ -467,7 +480,7 @@ func testHandlerConversion(t *testing.T, enableWatchCache bool) {
 	etcdOptions := options.NewEtcdOptions(storageConfig)
 	etcdOptions.StorageConfig.Codec = unstructured.UnstructuredJSONScheme
 	restOptionsGetter := generic.RESTOptions{
-		StorageConfig:           &etcdOptions.StorageConfig,
+		StorageConfig:           etcdOptions.StorageConfig.ForResource(schema.GroupResource{Group: crd.Spec.Group, Resource: crd.Spec.Names.Plural}),
 		Decorator:               generic.UndecoratedStorage,
 		EnableGarbageCollection: true,
 		DeleteCollectionWorkers: 1,
@@ -475,7 +488,7 @@ func testHandlerConversion(t *testing.T, enableWatchCache bool) {
 		CountMetricPollPeriod:   time.Minute,
 	}
 	if enableWatchCache {
-		restOptionsGetter.Decorator = genericregistry.StorageWithCacher(100)
+		restOptionsGetter.Decorator = genericregistry.StorageWithCacher()
 	}
 
 	handler, err := NewCustomResourceDefinitionHandler(
@@ -681,4 +694,174 @@ var multiVersionFixture = &apiextensionsv1.CustomResourceDefinition{
 			Plural: "multiversion", Singular: "multiversion", Kind: "MultiVersion", ShortNames: []string{"mv"}, ListKind: "MultiVersionList", Categories: []string{"all"},
 		},
 	},
+}
+
+func Test_defaultDeprecationWarning(t *testing.T) {
+	tests := []struct {
+		name              string
+		deprecatedVersion string
+		crd               apiextensionsv1.CustomResourceDefinitionSpec
+		want              string
+	}{
+		{
+			name:              "no replacement",
+			deprecatedVersion: "v1",
+			crd: apiextensionsv1.CustomResourceDefinitionSpec{
+				Group: "example.com",
+				Names: apiextensionsv1.CustomResourceDefinitionNames{Kind: "Widget"},
+				Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
+					{Name: "v1", Served: true, Deprecated: true},
+					{Name: "v2", Served: true, Deprecated: true},
+					{Name: "v3", Served: false},
+				},
+			},
+			want: "example.com/v1 Widget is deprecated",
+		},
+		{
+			name:              "replacement sorting",
+			deprecatedVersion: "v1",
+			crd: apiextensionsv1.CustomResourceDefinitionSpec{
+				Group: "example.com",
+				Names: apiextensionsv1.CustomResourceDefinitionNames{Kind: "Widget"},
+				Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
+					{Name: "v1", Served: true},
+					{Name: "v1alpha1", Served: true},
+					{Name: "v1alpha2", Served: true},
+					{Name: "v1beta1", Served: true},
+					{Name: "v1beta2", Served: true},
+					{Name: "v2", Served: true},
+					{Name: "v2alpha1", Served: true},
+					{Name: "v2alpha2", Served: true},
+					{Name: "v2beta1", Served: true},
+					{Name: "v2beta2", Served: true},
+					{Name: "v3", Served: false},
+					{Name: "v3alpha1", Served: false},
+					{Name: "v3alpha2", Served: false},
+					{Name: "v3beta1", Served: false},
+					{Name: "v3beta2", Served: false},
+				},
+			},
+			want: "example.com/v1 Widget is deprecated; use example.com/v2 Widget",
+		},
+		{
+			name:              "no newer replacement of equal stability",
+			deprecatedVersion: "v2",
+			crd: apiextensionsv1.CustomResourceDefinitionSpec{
+				Group: "example.com",
+				Names: apiextensionsv1.CustomResourceDefinitionNames{Kind: "Widget"},
+				Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
+					{Name: "v1", Served: true},
+					{Name: "v3", Served: false},
+					{Name: "v3alpha1", Served: true},
+					{Name: "v3beta1", Served: true},
+					{Name: "v4", Served: true, Deprecated: true},
+				},
+			},
+			want: "example.com/v2 Widget is deprecated",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := defaultDeprecationWarning(tt.deprecatedVersion, tt.crd); got != tt.want {
+				t.Errorf("defaultDeprecationWarning() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildOpenAPIModelsForApply(t *testing.T) {
+	// This is a list of validation that we expect to work.
+	tests := []apiextensionsv1.CustomResourceValidation{
+		{
+			OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+				Type:       "object",
+				Properties: map[string]apiextensionsv1.JSONSchemaProps{"num": {Type: "integer", Description: "v1beta1 num field"}},
+			},
+		},
+		{
+			OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+				Type:         "",
+				XIntOrString: true,
+			},
+		},
+		{
+			OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensionsv1.JSONSchemaProps{
+					"oneOf": {
+						OneOf: []apiextensionsv1.JSONSchemaProps{
+							{Type: "boolean"},
+							{Type: "string"},
+						},
+					},
+				},
+			},
+		},
+		{
+			OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+				Type: "object",
+				Properties: map[string]apiextensionsv1.JSONSchemaProps{
+					"nullable": {
+						Type:     "integer",
+						Nullable: true,
+					},
+				},
+			},
+		},
+	}
+
+	staticSpec, err := getOpenAPISpecFromFile()
+	if err != nil {
+		t.Fatalf("Failed to load openapi spec: %v", err)
+	}
+
+	crd := apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "example.stable.example.com", UID: types.UID("12345")},
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+			Group: "stable.example.com",
+			Names: apiextensionsv1.CustomResourceDefinitionNames{
+				Plural: "examples", Singular: "example", Kind: "Example", ShortNames: []string{"ex"}, ListKind: "ExampleList", Categories: []string{"all"},
+			},
+			Conversion:            &apiextensionsv1.CustomResourceConversion{Strategy: apiextensionsv1.NoneConverter},
+			Scope:                 apiextensionsv1.ClusterScoped,
+			PreserveUnknownFields: false,
+			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
+				{
+					Name: "v1beta1", Served: true, Storage: true,
+					Subresources: &apiextensionsv1.CustomResourceSubresources{Status: &apiextensionsv1.CustomResourceSubresourceStatus{}},
+				},
+			},
+		},
+	}
+
+	for i, test := range tests {
+		crd.Spec.Versions[0].Schema = &test
+		models, err := buildOpenAPIModelsForApply(staticSpec, &crd)
+		if err != nil {
+			t.Fatalf("failed to convert to apply model: %v", err)
+		}
+		if models == nil {
+			t.Fatalf("%d: failed to convert to apply model: nil", i)
+		}
+	}
+}
+
+func getOpenAPISpecFromFile() (*spec.Swagger, error) {
+	path := filepath.Join("testdata", "swagger.json")
+	_, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	byteSpec, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	staticSpec := &spec.Swagger{}
+
+	err = yaml.Unmarshal(byteSpec, staticSpec)
+	if err != nil {
+		return nil, err
+	}
+
+	return staticSpec, nil
 }

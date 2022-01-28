@@ -120,7 +120,7 @@ start_kubelet() {
   # we want to run this command as root but log the file to a normal user file
   # (so disable SC2024)
   # shellcheck disable=SC2024
-  if ! sudo -b "${KUBELET}" "$@" &>"${LOG_DIR}/${kubelet_log}"; then 
+  if ! sudo -b "${KUBELET}" "$@" &>"${LOG_DIR}/${kubelet_log}"; then
     echo "Failed to start kubelet"
     exit 1
   fi
@@ -200,9 +200,6 @@ start_kubelet --kubeconfig "${KUBELET_KUBECONFIG}" \
   --kubelet-cgroups=/kubelet \
   --system-cgroups=/system \
   --cgroup-root=/ \
-  "--network-plugin=${NETWORK_PLUGIN}" \
-  "--cni-conf-dir=${CNI_CONF_DIR}" \
-  "--cni-bin-dir=${CNI_BIN_DIR}" \
   --v=$log_level \
   --logtostderr
 

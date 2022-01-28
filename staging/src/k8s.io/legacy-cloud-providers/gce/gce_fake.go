@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -76,6 +77,8 @@ func NewFakeGCECloud(vals TestClusterValues) *Cloud {
 		networkProjectID: vals.ProjectID,
 		ClusterID:        fakeClusterID(vals.ClusterID),
 		onXPN:            vals.OnXPN,
+		metricsCollector: newLoadBalancerMetrics(),
+		projectsBasePath: getProjectsBasePath(service.BasePath),
 	}
 	c := cloud.NewMockGCE(&gceProjectRouter{gce})
 	gce.c = c

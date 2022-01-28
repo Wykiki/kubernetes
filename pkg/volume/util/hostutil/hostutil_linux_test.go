@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 /*
@@ -156,27 +157,37 @@ func TestGetSELinuxSupport(t *testing.T) {
 	tests := []struct {
 		name           string
 		mountPoint     string
+		selinuxEnabled bool
 		expectedResult bool
 	}{
 		{
+			"ext4 on / with disabled SELinux",
+			"/",
+			false,
+			false,
+		},
+		{
 			"ext4 on /",
 			"/",
+			true,
 			true,
 		},
 		{
 			"tmpfs on /var/lib/bar",
 			"/var/lib/bar",
+			true,
 			false,
 		},
 		{
 			"nfsv4",
 			"/media/nfs_vol",
+			true,
 			false,
 		},
 	}
 
 	for _, test := range tests {
-		out, err := GetSELinux(test.mountPoint, filename)
+		out, err := GetSELinux(test.mountPoint, filename, func() bool { return test.selinuxEnabled })
 		if err != nil {
 			t.Errorf("Test %s failed with error: %s", test.name, err)
 		}
@@ -283,6 +294,7 @@ func TestGetFileType(t *testing.T) {
 
 	for idx, tc := range testCase {
 		path, cleanUpPath, err := tc.setUp()
+		defer os.RemoveAll(cleanUpPath) // RemoveAll can deal with a empty path ""
 		if err != nil {
 			// Locally passed, but upstream CI is not friendly to create such device files
 			// Leave "Operation not permitted" out, which can be covered in an e2e test
@@ -290,9 +302,6 @@ func TestGetFileType(t *testing.T) {
 				continue
 			}
 			t.Fatalf("[%d-%s] unexpected error : %v", idx, tc.name, err)
-		}
-		if len(cleanUpPath) > 0 {
-			defer os.RemoveAll(cleanUpPath)
 		}
 
 		fileType, err := hu.GetFileType(path)
@@ -306,10 +315,7 @@ func TestGetFileType(t *testing.T) {
 }
 
 func isOperationNotPermittedError(err error) bool {
-	if strings.Contains(err.Error(), "Operation not permitted") {
-		return true
-	}
-	return false
+	return strings.Contains(err.Error(), "Operation not permitted")
 }
 
 func writeFile(content string) (string, string, error) {

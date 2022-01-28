@@ -17,12 +17,13 @@ limitations under the License.
 package deployment
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"testing"
 
 	apps "k8s.io/api/apps/v1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	extensions "k8s.io/api/extensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -42,7 +43,6 @@ import (
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
 	_ "k8s.io/kubernetes/pkg/apis/policy/install"
 	_ "k8s.io/kubernetes/pkg/apis/rbac/install"
-	_ "k8s.io/kubernetes/pkg/apis/settings/install"
 	_ "k8s.io/kubernetes/pkg/apis/storage/install"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/deployment/util"
@@ -222,7 +222,7 @@ func (f *fixture) run_(deploymentName string, startInformers bool, expectError b
 		informers.Start(stopCh)
 	}
 
-	err = c.syncDeployment(deploymentName)
+	err = c.syncDeployment(context.TODO(), deploymentName)
 	if !expectError && err != nil {
 		f.t.Errorf("error syncing deployment: %v", err)
 	} else if expectError && err == nil {
@@ -530,7 +530,7 @@ func TestGetReplicaSetsForDeployment(t *testing.T) {
 	defer close(stopCh)
 	informers.Start(stopCh)
 
-	rsList, err := c.getReplicaSetsForDeployment(d1)
+	rsList, err := c.getReplicaSetsForDeployment(context.TODO(), d1)
 	if err != nil {
 		t.Fatalf("getReplicaSetsForDeployment() error: %v", err)
 	}
@@ -542,7 +542,7 @@ func TestGetReplicaSetsForDeployment(t *testing.T) {
 		t.Errorf("getReplicaSetsForDeployment() = %v, want [%v]", rsNames, rs1.Name)
 	}
 
-	rsList, err = c.getReplicaSetsForDeployment(d2)
+	rsList, err = c.getReplicaSetsForDeployment(context.TODO(), d2)
 	if err != nil {
 		t.Fatalf("getReplicaSetsForDeployment() error: %v", err)
 	}
@@ -580,7 +580,7 @@ func TestGetReplicaSetsForDeploymentAdoptRelease(t *testing.T) {
 	defer close(stopCh)
 	informers.Start(stopCh)
 
-	rsList, err := c.getReplicaSetsForDeployment(d)
+	rsList, err := c.getReplicaSetsForDeployment(context.TODO(), d)
 	if err != nil {
 		t.Fatalf("getReplicaSetsForDeployment() error: %v", err)
 	}

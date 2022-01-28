@@ -30,7 +30,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
+	policyv1 "k8s.io/api/policy/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,7 +43,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
-	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2emanifest "k8s.io/kubernetes/test/e2e/framework/manifest"
 	e2enetwork "k8s.io/kubernetes/test/e2e/framework/network"
@@ -95,7 +94,6 @@ var _ = SIGDescribe("Cluster size autoscaling [Slow]", func() {
 	f := framework.NewDefaultFramework("autoscaling")
 	var c clientset.Interface
 	var nodeCount int
-	var coreCount int64
 	var memAllocatableMb int
 	var originalSizes map[string]int
 
@@ -118,11 +116,6 @@ var _ = SIGDescribe("Cluster size autoscaling [Slow]", func() {
 		nodes, err := e2enode.GetReadySchedulableNodes(f.ClientSet)
 		framework.ExpectNoError(err)
 		nodeCount = len(nodes.Items)
-		coreCount = 0
-		for _, node := range nodes.Items {
-			quantity := node.Status.Allocatable[v1.ResourceCPU]
-			coreCount += quantity.Value()
-		}
 		ginkgo.By(fmt.Sprintf("Initial number of schedulable nodes: %v", nodeCount))
 		framework.ExpectNotEqual(nodeCount, 0)
 		mem := nodes.Items[0].Status.Allocatable[v1.ResourceMemory]
@@ -184,14 +177,16 @@ var _ = SIGDescribe("Cluster size autoscaling [Slow]", func() {
 			framework.ExpectNoError(err)
 
 			for _, e := range events.Items {
-				if e.InvolvedObject.Kind == "Pod" && e.Reason == "NotTriggerScaleUp" && strings.Contains(e.Message, "it wouldn't fit if a new node is added") {
+				if e.InvolvedObject.Kind == "Pod" && e.Reason == "NotTriggerScaleUp" {
 					ginkgo.By("NotTriggerScaleUp event found")
 					eventFound = true
 					break EventsLoop
 				}
 			}
 		}
-		framework.ExpectEqual(eventFound, true)
+		if !eventFound {
+			framework.Failf("Expected event with kind 'Pod' and reason 'NotTriggerScaleUp' not found.")
+		}
 		// Verify that cluster size is not changed
 		framework.ExpectNoError(WaitForClusterSizeFunc(f.ClientSet,
 			func(size int) bool { return size <= nodeCount }, time.Second))
@@ -498,9 +493,9 @@ var _ = SIGDescribe("Cluster size autoscaling [Slow]", func() {
 			StorageClassName: &emptyStorageClass,
 		}
 
-		pv, pvc, err := e2epv.CreatePVPVC(c, pvConfig, pvcConfig, f.Namespace.Name, false)
+		pv, pvc, err := e2epv.CreatePVPVC(c, f.Timeouts, pvConfig, pvcConfig, f.Namespace.Name, false)
 		framework.ExpectNoError(err)
-		framework.ExpectNoError(e2epv.WaitOnPVandPVC(c, f.Namespace.Name, pv, pvc))
+		framework.ExpectNoError(e2epv.WaitOnPVandPVC(c, f.Timeouts, f.Namespace.Name, pv, pvc))
 
 		defer func() {
 			errs := e2epv.PVPVCCleanup(c, f.Namespace.Name, pv, pvc)
@@ -858,7 +853,9 @@ var _ = SIGDescribe("Cluster size autoscaling [Slow]", func() {
 		framework.ExpectNoError(e2enode.WaitForReadyNodes(c, nodeCount-minSize+1, resizeTimeout))
 		ngNodes, err := framework.GetGroupNodes(minMig)
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(len(ngNodes) == 1, true)
+		if len(ngNodes) != 1 {
+			framework.Failf("Expected one node, got instead: %v", ngNodes)
+		}
 		node, err := f.ClientSet.CoreV1().Nodes().Get(context.TODO(), ngNodes[0], metav1.GetOptions{})
 		ginkgo.By(fmt.Sprintf("Target node for scale-down: %s", node.Name))
 		framework.ExpectNoError(err)
@@ -895,14 +892,17 @@ var _ = SIGDescribe("Cluster size autoscaling [Slow]", func() {
 		// If new nodes are disconnected too soon, they'll be considered not started
 		// instead of unready, and cluster won't be considered unhealthy.
 		//
-		// More precisely, Cluster Autoscaler compares last transition time of
-		// several readiness conditions to node create time. If it's within
-		// 2 minutes, it'll assume node is just starting and not unhealthy.
+		// More precisely, Cluster Autoscaler will never consider a
+		// node to be unhealthy unless it was created more than 15m
+		// ago. Within that 15m window, it'll assume node is just
+		// starting and not unhealthy.
 		//
-		// Nodes become ready in less than 1 minute after being created,
-		// so waiting extra 2 minutes before breaking them (which triggers
-		// readiness condition transition) should be sufficient, while
-		// making no assumptions about minimal node startup time.
+		// However, waiting for 15m would allow scale down to kick in
+		// and remove recently added nodes, so here we just wait 2m for
+		// nodes to come up (1m should be enough, another 1m added as
+		// an extra buffer. Then, we break connectivity to a subset of
+		// nodes and only after that we wait for 15m, since scale down
+		// shouldn't happen when the cluster is unhealthy.
 		time.Sleep(2 * time.Minute)
 
 		ginkgo.By("Block network connectivity to some nodes to simulate unhealthy cluster")
@@ -911,7 +911,9 @@ var _ = SIGDescribe("Cluster size autoscaling [Slow]", func() {
 			"spec.unschedulable": "false",
 		}.AsSelector().String()})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(nodesToBreakCount <= len(nodes.Items), true)
+		if nodesToBreakCount > len(nodes.Items) {
+			framework.Failf("Expected at most %d nodes to break, got %d", len(nodes.Items), nodesToBreakCount)
+		}
 		nodesToBreak := nodes.Items[:nodesToBreakCount]
 
 		// TestUnderTemporaryNetworkFailure only removes connectivity to a single node,
@@ -926,7 +928,8 @@ var _ = SIGDescribe("Cluster size autoscaling [Slow]", func() {
 			} else {
 				ReserveMemory(f, "memory-reservation", 100, nodeCount*memAllocatableMb, false, defaultTimeout)
 				defer e2erc.DeleteRCAndWaitForGC(f.ClientSet, f.Namespace.Name, "memory-reservation")
-				time.Sleep(scaleUpTimeout)
+				// Wait for 15m to ensure Cluster Autoscaler won't consider broken nodes as still starting.
+				time.Sleep(15 * time.Minute)
 				currentNodes, err := e2enode.GetReadySchedulableNodes(f.ClientSet)
 				framework.ExpectNoError(err)
 				framework.Logf("Currently available nodes: %v, nodes available at the start of test: %v, disabled nodes: %v", len(currentNodes.Items), len(nodes.Items), nodesToBreakCount)
@@ -1035,20 +1038,20 @@ func runDrainTest(f *framework.Framework, migSizes map[string]int, namespace str
 
 	ginkgo.By("Create a PodDisruptionBudget")
 	minAvailable := intstr.FromInt(numPods - pdbSize)
-	pdb := &policyv1beta1.PodDisruptionBudget{
+	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test_pdb",
 			Namespace: namespace,
 		},
-		Spec: policyv1beta1.PodDisruptionBudgetSpec{
+		Spec: policyv1.PodDisruptionBudgetSpec{
 			Selector:     &metav1.LabelSelector{MatchLabels: labelMap},
 			MinAvailable: &minAvailable,
 		},
 	}
-	_, err = f.ClientSet.PolicyV1beta1().PodDisruptionBudgets(namespace).Create(context.TODO(), pdb, metav1.CreateOptions{})
+	_, err = f.ClientSet.PolicyV1().PodDisruptionBudgets(namespace).Create(context.TODO(), pdb, metav1.CreateOptions{})
 
 	defer func() {
-		f.ClientSet.PolicyV1beta1().PodDisruptionBudgets(namespace).Delete(context.TODO(), pdb.Name, metav1.DeleteOptions{})
+		f.ClientSet.PolicyV1().PodDisruptionBudgets(namespace).Delete(context.TODO(), pdb.Name, metav1.DeleteOptions{})
 	}()
 
 	framework.ExpectNoError(err)
@@ -1253,6 +1256,7 @@ func getPoolNodes(f *framework.Framework, poolName string) []*v1.Node {
 	framework.ExpectNoErrorWithOffset(0, err)
 	for _, node := range nodeList.Items {
 		if node.Labels[gkeNodepoolNameKey] == poolName {
+			node := node
 			nodes = append(nodes, &node)
 		}
 	}
@@ -1456,7 +1460,7 @@ func drainNode(f *framework.Framework, node *v1.Node) {
 	makeNodeUnschedulable(f.ClientSet, node)
 
 	ginkgo.By("Manually drain the single node")
-	podOpts := metav1.ListOptions{FieldSelector: fields.OneTermEqualSelector(api.PodHostField, node.Name).String()}
+	podOpts := metav1.ListOptions{FieldSelector: fields.OneTermEqualSelector("spec.nodeName", node.Name).String()}
 	pods, err := f.ClientSet.CoreV1().Pods(metav1.NamespaceAll).List(context.TODO(), podOpts)
 	framework.ExpectNoError(err)
 	for _, pod := range pods.Items {
@@ -1888,7 +1892,7 @@ func addKubeSystemPdbs(f *framework.Framework) (func(), error) {
 		var finalErr error
 		for _, newPdbName := range newPdbs {
 			ginkgo.By(fmt.Sprintf("Delete PodDisruptionBudget %v", newPdbName))
-			err := f.ClientSet.PolicyV1beta1().PodDisruptionBudgets("kube-system").Delete(context.TODO(), newPdbName, metav1.DeleteOptions{})
+			err := f.ClientSet.PolicyV1().PodDisruptionBudgets("kube-system").Delete(context.TODO(), newPdbName, metav1.DeleteOptions{})
 			if err != nil {
 				// log error, but attempt to remove other pdbs
 				klog.Errorf("Failed to delete PodDisruptionBudget %v, err: %v", newPdbName, err)
@@ -1916,17 +1920,17 @@ func addKubeSystemPdbs(f *framework.Framework) (func(), error) {
 		labelMap := map[string]string{"k8s-app": pdbData.label}
 		pdbName := fmt.Sprintf("test-pdb-for-%v", pdbData.label)
 		minAvailable := intstr.FromInt(pdbData.minAvailable)
-		pdb := &policyv1beta1.PodDisruptionBudget{
+		pdb := &policyv1.PodDisruptionBudget{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      pdbName,
 				Namespace: "kube-system",
 			},
-			Spec: policyv1beta1.PodDisruptionBudgetSpec{
+			Spec: policyv1.PodDisruptionBudgetSpec{
 				Selector:     &metav1.LabelSelector{MatchLabels: labelMap},
 				MinAvailable: &minAvailable,
 			},
 		}
-		_, err := f.ClientSet.PolicyV1beta1().PodDisruptionBudgets("kube-system").Create(context.TODO(), pdb, metav1.CreateOptions{})
+		_, err := f.ClientSet.PolicyV1().PodDisruptionBudgets("kube-system").Create(context.TODO(), pdb, metav1.CreateOptions{})
 		newPdbs = append(newPdbs, pdbName)
 
 		if err != nil {
@@ -1946,7 +1950,9 @@ func createPriorityClasses(f *framework.Framework) func() {
 		if err != nil {
 			klog.Errorf("Error creating priority class: %v", err)
 		}
-		framework.ExpectEqual(err == nil || apierrors.IsAlreadyExists(err), true)
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			framework.Failf("unexpected error while creating priority class: %v", err)
+		}
 	}
 
 	return func() {

@@ -18,55 +18,35 @@ package noderestriction
 
 import (
 	"context"
-	"fmt"
+	"k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/kubernetes/pkg/features"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/authentication/user"
 	corev1lister "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/component-base/featuregate"
+	kubeletapis "k8s.io/kubelet/pkg/apis"
 	authenticationapi "k8s.io/kubernetes/pkg/apis/authentication"
 	"k8s.io/kubernetes/pkg/apis/coordination"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/policy"
 	storage "k8s.io/kubernetes/pkg/apis/storage"
 	"k8s.io/kubernetes/pkg/auth/nodeidentifier"
-	"k8s.io/kubernetes/pkg/features"
-	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
 	"k8s.io/utils/pointer"
 )
-
-var (
-	trEnabledFeature           = featuregate.NewFeatureGate()
-	csiNodeInfoEnabledFeature  = featuregate.NewFeatureGate()
-	csiNodeInfoDisabledFeature = featuregate.NewFeatureGate()
-)
-
-func init() {
-	// all features need to be set on all featuregates for the tests.  We set everything and then then the if's below override it.
-	relevantFeatures := map[featuregate.Feature]featuregate.FeatureSpec{
-		features.TokenRequest:            {Default: false},
-		features.CSINodeInfo:             {Default: false},
-		features.ExpandPersistentVolumes: {Default: false},
-	}
-	utilruntime.Must(trEnabledFeature.Add(relevantFeatures))
-	utilruntime.Must(csiNodeInfoEnabledFeature.Add(relevantFeatures))
-	utilruntime.Must(csiNodeInfoDisabledFeature.Add(relevantFeatures))
-
-	utilruntime.Must(trEnabledFeature.SetFromMap(map[string]bool{string(features.TokenRequest): true}))
-	utilruntime.Must(csiNodeInfoEnabledFeature.SetFromMap(map[string]bool{string(features.CSINodeInfo): true}))
-}
 
 func makeTestPod(namespace, name, node string, mirror bool) (*api.Pod, *corev1.Pod) {
 	corePod := &api.Pod{}
@@ -402,7 +382,7 @@ func Test_nodePlugin_Admit(t *testing.T) {
 	existingPodsIndex.Add(v1otherpod)
 	existingPodsIndex.Add(v1unboundpod)
 
-	existingNodesIndex.Add(&v1.Node{ObjectMeta: mynodeObjMeta})
+	existingNodesIndex.Add(&corev1.Node{ObjectMeta: mynodeObjMeta})
 
 	sapod, _ := makeTestPod("ns", "mysapod", "mynode", true)
 	sapod.Spec.ServiceAccountName = "foo"
@@ -920,7 +900,7 @@ func Test_nodePlugin_Admit(t *testing.T) {
 		{
 			name:       "forbid create of my node with forbidden labels",
 			podsGetter: noExistingPods,
-			attributes: admission.NewAttributesRecord(setForbiddenCreateLabels(mynodeObj, ""), nil, nodeKind, mynodeObj.Namespace, "", nodeResource, "", admission.Create, &metav1.CreateOptions{}, false, mynode),
+			attributes: admission.NewAttributesRecord(setForbiddenCreateLabels(mynodeObj, ""), nil, nodeKind, mynodeObj.Namespace, "mynode", nodeResource, "", admission.Create, &metav1.CreateOptions{}, false, mynode),
 			err:        `is not allowed to set the following labels: foo.node-restriction.kubernetes.io/foo, node-restriction.kubernetes.io/foo, other.k8s.io/foo, other.kubernetes.io/foo`,
 		},
 		{
@@ -1086,35 +1066,30 @@ func Test_nodePlugin_Admit(t *testing.T) {
 		{
 			name:       "forbid create of unbound token",
 			podsGetter: noExistingPods,
-			features:   trEnabledFeature,
 			attributes: admission.NewAttributesRecord(makeTokenRequest("", ""), nil, tokenrequestKind, "ns", "mysa", svcacctResource, "token", admission.Create, &metav1.CreateOptions{}, false, mynode),
 			err:        "not bound to a pod",
 		},
 		{
 			name:       "forbid create of token bound to nonexistant pod",
 			podsGetter: noExistingPods,
-			features:   trEnabledFeature,
 			attributes: admission.NewAttributesRecord(makeTokenRequest("nopod", "someuid"), nil, tokenrequestKind, "ns", "mysa", svcacctResource, "token", admission.Create, &metav1.CreateOptions{}, false, mynode),
 			err:        "not found",
 		},
 		{
 			name:       "forbid create of token bound to pod without uid",
 			podsGetter: existingPods,
-			features:   trEnabledFeature,
 			attributes: admission.NewAttributesRecord(makeTokenRequest(coremypod.Name, ""), nil, tokenrequestKind, "ns", "mysa", svcacctResource, "token", admission.Create, &metav1.CreateOptions{}, false, mynode),
 			err:        "pod binding without a uid",
 		},
 		{
 			name:       "forbid create of token bound to pod scheduled on another node",
 			podsGetter: existingPods,
-			features:   trEnabledFeature,
 			attributes: admission.NewAttributesRecord(makeTokenRequest(coreotherpod.Name, coreotherpod.UID), nil, tokenrequestKind, coreotherpod.Namespace, "mysa", svcacctResource, "token", admission.Create, &metav1.CreateOptions{}, false, mynode),
 			err:        "pod scheduled on a different node",
 		},
 		{
 			name:       "allow create of token bound to pod scheduled this node",
 			podsGetter: existingPods,
-			features:   trEnabledFeature,
 			attributes: admission.NewAttributesRecord(makeTokenRequest(coremypod.Name, coremypod.UID), nil, tokenrequestKind, coremypod.Namespace, "mysa", svcacctResource, "token", admission.Create, &metav1.CreateOptions{}, false, mynode),
 		},
 
@@ -1223,45 +1198,33 @@ func Test_nodePlugin_Admit(t *testing.T) {
 		},
 		// CSINode
 		{
-			name:       "disallowed create CSINode - feature disabled",
-			attributes: admission.NewAttributesRecord(nodeInfo, nil, csiNodeKind, nodeInfo.Namespace, nodeInfo.Name, csiNodeResource, "", admission.Create, &metav1.CreateOptions{}, false, mynode),
-			features:   csiNodeInfoDisabledFeature,
-			err:        fmt.Sprintf("forbidden: disabled by feature gates %s", features.CSINodeInfo),
-		},
-		{
-			name:       "disallowed create another node's CSINode - feature enabled",
+			name:       "disallowed create another node's CSINode",
 			attributes: admission.NewAttributesRecord(nodeInfoWrongName, nil, csiNodeKind, nodeInfoWrongName.Namespace, nodeInfoWrongName.Name, csiNodeResource, "", admission.Create, &metav1.CreateOptions{}, false, mynode),
-			features:   csiNodeInfoEnabledFeature,
 			err:        "forbidden: ",
 		},
 		{
-			name:       "disallowed update another node's CSINode - feature enabled",
+			name:       "disallowed update another node's CSINode",
 			attributes: admission.NewAttributesRecord(nodeInfoWrongName, nodeInfoWrongName, csiNodeKind, nodeInfoWrongName.Namespace, nodeInfoWrongName.Name, csiNodeResource, "", admission.Update, &metav1.UpdateOptions{}, false, mynode),
-			features:   csiNodeInfoEnabledFeature,
 			err:        "forbidden: ",
 		},
 		{
-			name:       "disallowed delete another node's CSINode - feature enabled",
+			name:       "disallowed delete another node's CSINode",
 			attributes: admission.NewAttributesRecord(nil, nil, csiNodeKind, nodeInfoWrongName.Namespace, nodeInfoWrongName.Name, csiNodeResource, "", admission.Delete, &metav1.DeleteOptions{}, false, mynode),
-			features:   csiNodeInfoEnabledFeature,
 			err:        "forbidden: ",
 		},
 		{
-			name:       "allowed create node CSINode - feature enabled",
+			name:       "allowed create node CSINode",
 			attributes: admission.NewAttributesRecord(nodeInfo, nil, csiNodeKind, nodeInfo.Namespace, nodeInfo.Name, csiNodeResource, "", admission.Create, &metav1.CreateOptions{}, false, mynode),
-			features:   csiNodeInfoEnabledFeature,
 			err:        "",
 		},
 		{
-			name:       "allowed update node CSINode - feature enabled",
+			name:       "allowed update node CSINode",
 			attributes: admission.NewAttributesRecord(nodeInfo, nodeInfo, csiNodeKind, nodeInfo.Namespace, nodeInfo.Name, csiNodeResource, "", admission.Update, &metav1.UpdateOptions{}, false, mynode),
-			features:   csiNodeInfoEnabledFeature,
 			err:        "",
 		},
 		{
-			name:       "allowed delete node CSINode - feature enabled",
+			name:       "allowed delete node CSINode",
 			attributes: admission.NewAttributesRecord(nil, nil, csiNodeKind, nodeInfo.Namespace, nodeInfo.Name, csiNodeResource, "", admission.Delete, &metav1.UpdateOptions{}, false, mynode),
-			features:   csiNodeInfoEnabledFeature,
 			err:        "",
 		},
 	}
@@ -1273,11 +1236,11 @@ func Test_nodePlugin_Admit(t *testing.T) {
 
 func Test_nodePlugin_Admit_OwnerReference(t *testing.T) {
 	expectedNodeIndex := cache.NewIndexer(cache.MetaNamespaceKeyFunc, nil)
-	expectedNodeIndex.Add(&v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "mynode", UID: "mynode-uid"}})
+	expectedNodeIndex.Add(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "mynode", UID: "mynode-uid"}})
 	expectedNode := corev1lister.NewNodeLister(expectedNodeIndex)
 
 	unexpectedNodeIndex := cache.NewIndexer(cache.MetaNamespaceKeyFunc, nil)
-	unexpectedNodeIndex.Add(&v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "mynode", UID: "mynode-unexpected-uid"}})
+	unexpectedNodeIndex.Add(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "mynode", UID: "mynode-unexpected-uid"}})
 	unexpectedNode := corev1lister.NewNodeLister(unexpectedNodeIndex)
 
 	noNodesIndex := cache.NewIndexer(cache.MetaNamespaceKeyFunc, nil)
@@ -1314,8 +1277,9 @@ func Test_nodePlugin_Admit_OwnerReference(t *testing.T) {
 		expectErr   string
 	}{
 		{
-			name:   "no owner",
-			owners: nil,
+			name:      "no owner",
+			owners:    nil,
+			expectErr: "pods \"test\" is forbidden: node \"mynode\" can only create pods with an owner reference set to itself",
 		},
 		{
 			name:   "valid owner",
@@ -1463,6 +1427,157 @@ func Test_getModifiedLabels(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAdmitPVCStatus(t *testing.T) {
+	expectedNodeIndex := cache.NewIndexer(cache.MetaNamespaceKeyFunc, nil)
+	expectedNodeIndex.Add(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "mynode", UID: "mynode-uid"}})
+	expectedNode := corev1lister.NewNodeLister(expectedNodeIndex)
+	noExistingPodsIndex := cache.NewIndexer(cache.MetaNamespaceKeyFunc, nil)
+	noExistingPods := corev1lister.NewPodLister(noExistingPodsIndex)
+	mynode := &user.DefaultInfo{Name: "system:node:mynode", Groups: []string{"system:nodes"}}
+
+	tests := []struct {
+		name                    string
+		resource                schema.GroupVersionResource
+		subresource             string
+		newObj                  runtime.Object
+		oldObj                  runtime.Object
+		expansionFeatureEnabled bool
+		recoveryFeatureEnabled  bool
+		expectError             string
+	}{
+		{
+			name: "should not allow full pvc update from nodes",
+			oldObj: makeTestPVC(
+				api.PersistentVolumeClaimResizing,
+				api.PersistentVolumeClaimNoExpansionInProgress, "10G",
+			),
+			subresource: "",
+			newObj: makeTestPVC(
+				"", api.PersistentVolumeClaimNoExpansionInProgress, "10G",
+			),
+			expectError: "is forbidden: may only update PVC status",
+		},
+		{
+			name: "should allow capacity and condition updates, if expansion is enabled",
+			oldObj: makeTestPVC(
+				api.PersistentVolumeClaimResizing,
+				api.PersistentVolumeClaimNoExpansionInProgress, "10G",
+			),
+			expansionFeatureEnabled: true,
+			subresource:             "status",
+			newObj: makeTestPVC(
+				api.PersistentVolumeClaimFileSystemResizePending,
+				api.PersistentVolumeClaimNoExpansionInProgress, "10G",
+			),
+			expectError: "",
+		},
+		{
+			name: "should not allow updates to allocatedResources with just expansion enabled",
+			oldObj: makeTestPVC(
+				api.PersistentVolumeClaimResizing,
+				api.PersistentVolumeClaimNoExpansionInProgress, "10G",
+			),
+			subresource:             "status",
+			expansionFeatureEnabled: true,
+			newObj: makeTestPVC(
+				api.PersistentVolumeClaimFileSystemResizePending,
+				api.PersistentVolumeClaimNoExpansionInProgress, "15G",
+			),
+			expectError: "is not allowed to update fields other than",
+		},
+		{
+			name: "should allow updates to allocatedResources with expansion and recovery enabled",
+			oldObj: makeTestPVC(
+				api.PersistentVolumeClaimResizing,
+				api.PersistentVolumeClaimNoExpansionInProgress, "10G",
+			),
+			subresource:             "status",
+			expansionFeatureEnabled: true,
+			recoveryFeatureEnabled:  true,
+			newObj: makeTestPVC(
+				api.PersistentVolumeClaimFileSystemResizePending,
+				api.PersistentVolumeClaimNoExpansionInProgress, "15G",
+			),
+			expectError: "",
+		},
+		{
+			name: "should allow updates to resizeStatus with expansion and recovery enabled",
+			oldObj: makeTestPVC(
+				api.PersistentVolumeClaimResizing,
+				api.PersistentVolumeClaimNoExpansionInProgress, "10G",
+			),
+			subresource:             "status",
+			expansionFeatureEnabled: true,
+			recoveryFeatureEnabled:  true,
+			newObj: makeTestPVC(
+				api.PersistentVolumeClaimResizing,
+				api.PersistentVolumeClaimNodeExpansionFailed, "10G",
+			),
+			expectError: "",
+		},
+	}
+
+	for i := range tests {
+		test := tests[i]
+		t.Run(test.name, func(t *testing.T) {
+			operation := admission.Update
+			apiResource := api.SchemeGroupVersion.WithResource("persistentvolumeclaims")
+			attributes := admission.NewAttributesRecord(
+				test.newObj, test.oldObj, schema.GroupVersionKind{},
+				metav1.NamespaceDefault, "foo", apiResource, test.subresource, operation, &metav1.CreateOptions{}, false, mynode)
+
+			defer featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.ExpandPersistentVolumes, test.expansionFeatureEnabled)()
+			defer featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.RecoverVolumeExpansionFailure, test.recoveryFeatureEnabled)()
+			a := &admitTestCase{
+				name:        test.name,
+				podsGetter:  noExistingPods,
+				nodesGetter: expectedNode,
+				attributes:  attributes,
+				features:    feature.DefaultFeatureGate,
+				err:         test.expectError,
+			}
+			a.run(t)
+		})
+
+	}
+}
+
+func makeTestPVC(
+	condition api.PersistentVolumeClaimConditionType,
+	resizeStatus api.PersistentVolumeClaimResizeStatus,
+	allocatedResources string) *api.PersistentVolumeClaim {
+	pvc := &api.PersistentVolumeClaim{
+		Spec: api.PersistentVolumeClaimSpec{
+			VolumeName: "volume1",
+			Resources: api.ResourceRequirements{
+				Requests: api.ResourceList{
+					api.ResourceStorage: resource.MustParse("10G"),
+				},
+			},
+		},
+		Status: api.PersistentVolumeClaimStatus{
+			Capacity: api.ResourceList{
+				api.ResourceStorage: resource.MustParse(allocatedResources),
+			},
+			Phase:        api.ClaimBound,
+			ResizeStatus: &resizeStatus,
+			AllocatedResources: api.ResourceList{
+				api.ResourceStorage: resource.MustParse(allocatedResources),
+			},
+		},
+	}
+	if len(condition) > 0 {
+		pvc.Status.Conditions = []api.PersistentVolumeClaimCondition{
+			{
+				Type:   condition,
+				Status: api.ConditionTrue,
+			},
+		}
+	}
+
+	return pvc
 }
 
 func createPodAttributes(pod *api.Pod, user user.Info) admission.Attributes {

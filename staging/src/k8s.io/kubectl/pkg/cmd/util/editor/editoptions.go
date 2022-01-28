@@ -19,6 +19,7 @@ package editor
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -35,6 +36,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -71,6 +73,8 @@ type EditOptions struct {
 	CmdNamespace    string
 	ApplyAnnotation bool
 	ChangeCause     string
+
+	managedFields map[types.UID][]metav1.ManagedFieldsEntry
 
 	genericclioptions.IOStreams
 
@@ -262,6 +266,10 @@ func (o *EditOptions) Run() error {
 			}
 
 			if !containsError {
+				if err := o.extractManagedFields(originalObj); err != nil {
+					return preservedFile(err, results.file, o.ErrOut)
+				}
+
 				if err := o.editPrinterOptions.PrintObj(originalObj, w); err != nil {
 					return preservedFile(err, results.file, o.ErrOut)
 				}
@@ -279,6 +287,7 @@ func (o *EditOptions) Run() error {
 			if err != nil {
 				return preservedFile(err, results.file, o.ErrOut)
 			}
+
 			// If we're retrying the loop because of an error, and no change was made in the file, short-circuit
 			if containsError && bytes.Equal(cmdutil.StripComments(editedDiff), cmdutil.StripComments(edited)) {
 				return preservedFile(fmt.Errorf("%s", "Edit cancelled, no valid changes were saved."), file, o.ErrOut)
@@ -334,9 +343,18 @@ func (o *EditOptions) Run() error {
 				results.header.reasons = append(results.header.reasons, editReason{head: fmt.Sprintf("The edited file had a syntax error: %v", err)})
 				continue
 			}
+
 			// not a syntax error as it turns out...
 			containsError = false
 			updatedVisitor := resource.InfoListVisitor(updatedInfos)
+
+			// we need to add back managedFields to both updated and original object
+			if err := o.restoreManagedFields(updatedInfos); err != nil {
+				return preservedFile(err, file, o.ErrOut)
+			}
+			if err := o.restoreManagedFields(infos); err != nil {
+				return preservedFile(err, file, o.ErrOut)
+			}
 
 			// need to make sure the original namespace wasn't changed while editing
 			if err := updatedVisitor.Visit(resource.RequireNamespace(o.CmdNamespace)); err != nil {
@@ -435,6 +453,49 @@ func (o *EditOptions) Run() error {
 	default:
 		return fmt.Errorf("unsupported edit mode %q", o.EditMode)
 	}
+}
+
+func (o *EditOptions) extractManagedFields(obj runtime.Object) error {
+	o.managedFields = make(map[types.UID][]metav1.ManagedFieldsEntry)
+	if meta.IsListType(obj) {
+		err := meta.EachListItem(obj, func(obj runtime.Object) error {
+			uid, mf, err := clearManagedFields(obj)
+			if err != nil {
+				return err
+			}
+			o.managedFields[uid] = mf
+			return nil
+		})
+		return err
+	}
+	uid, mf, err := clearManagedFields(obj)
+	if err != nil {
+		return err
+	}
+	o.managedFields[uid] = mf
+	return nil
+}
+
+func clearManagedFields(obj runtime.Object) (types.UID, []metav1.ManagedFieldsEntry, error) {
+	metaObjs, err := meta.Accessor(obj)
+	if err != nil {
+		return "", nil, err
+	}
+	mf := metaObjs.GetManagedFields()
+	metaObjs.SetManagedFields(nil)
+	return metaObjs.GetUID(), mf, nil
+}
+
+func (o *EditOptions) restoreManagedFields(infos []*resource.Info) error {
+	for _, info := range infos {
+		metaObjs, err := meta.Accessor(info.Object)
+		if err != nil {
+			return err
+		}
+		mf := o.managedFields[metaObjs.GetUID()]
+		metaObjs.SetManagedFields(mf)
+	}
+	return nil
 }
 
 func (o *EditOptions) visitToApplyEditPatch(originalInfos []*resource.Info, patchVisitor resource.Visitor) error {
@@ -590,6 +651,7 @@ func (o *EditOptions) visitToPatch(originalInfos []*resource.Info, patchVisitor 
 			mergepatch.RequireKeyUnchanged("apiVersion"),
 			mergepatch.RequireKeyUnchanged("kind"),
 			mergepatch.RequireMetadataKeyUnchanged("name"),
+			mergepatch.RequireKeyUnchanged("managedFields"),
 		}
 
 		// Create the versioned struct from the type defined in the mapping
@@ -606,8 +668,14 @@ func (o *EditOptions) visitToPatch(originalInfos []*resource.Info, patchVisitor 
 				klog.V(4).Infof("Unable to calculate diff, no merge is possible: %v", err)
 				return err
 			}
+			var patchMap map[string]interface{}
+			err = json.Unmarshal(patch, &patchMap)
+			if err != nil {
+				klog.V(4).Infof("Unable to calculate diff, no merge is possible: %v", err)
+				return err
+			}
 			for _, precondition := range preconditions {
-				if !precondition(patch) {
+				if !precondition(patchMap) {
 					klog.V(4).Infof("Unable to calculate diff, no merge is possible: %v", err)
 					return fmt.Errorf("%s", "At least one of apiVersion, kind and name was changed")
 				}

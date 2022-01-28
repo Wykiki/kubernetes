@@ -24,6 +24,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -61,7 +62,13 @@ func unsetEnv(key string) func() {
 
 func TestHTTPProbeProxy(t *testing.T) {
 	res := "welcome to http probe proxy"
-	localProxy := "http://127.0.0.1:9098/"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, res)
+	}))
+	defer server.Close()
+
+	localProxy := server.URL
 
 	defer setEnv("http_proxy", localProxy)()
 	defer setEnv("HTTP_PROXY", localProxy)()
@@ -70,16 +77,6 @@ func TestHTTPProbeProxy(t *testing.T) {
 
 	followNonLocalRedirects := true
 	prober := New(followNonLocalRedirects)
-
-	go func() {
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			fmt.Fprint(w, res)
-		})
-		err := http.ListenAndServe(":9098", nil)
-		if err != nil {
-			t.Errorf("Failed to start foo server: localhost:9098")
-		}
-	}()
 
 	// take some time to wait server boot
 	time.Sleep(2 * time.Second)
@@ -114,12 +111,41 @@ func TestHTTPProbeChecker(t *testing.T) {
 		w.Write([]byte(output))
 	}
 
+	// Handler that returns the number of request headers in the body
+	headerCounterHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(strconv.Itoa(len(r.Header))))
+	}
+
+	// Handler that returns the keys of request headers in the body
+	headerKeysNamesHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		keys := make([]string, 0, len(r.Header))
+		for k := range r.Header {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		w.Write([]byte(strings.Join(keys, "\n")))
+	}
+
 	redirectHandler := func(s int, bad bool) func(w http.ResponseWriter, r *http.Request) {
 		return func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/" {
 				http.Redirect(w, r, "/new", s)
 			} else if bad && r.URL.Path == "/new" {
 				http.Error(w, "", http.StatusInternalServerError)
+			}
+		}
+	}
+
+	redirectHandlerWithBody := func(s int, body string) func(w http.ResponseWriter, r *http.Request) {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/" {
+				http.Redirect(w, r, "/new", s)
+			} else if r.URL.Path == "/new" {
+				w.WriteHeader(s)
+				w.Write([]byte(body))
 			}
 		}
 	}
@@ -138,6 +164,42 @@ func TestHTTPProbeChecker(t *testing.T) {
 			handler: handleReq(http.StatusOK, "ok body"),
 			health:  probe.Success,
 			accBody: "ok body",
+		},
+		{
+			handler:    headerCounterHandler,
+			reqHeaders: http.Header{},
+			health:     probe.Success,
+			accBody:    "3",
+		},
+		{
+			handler:    headerKeysNamesHandler,
+			reqHeaders: http.Header{},
+			health:     probe.Success,
+			accBody:    "Accept\nConnection\nUser-Agent",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"Accept-Encoding": {"gzip"},
+			},
+			health:  probe.Success,
+			accBody: "Accept-Encoding: gzip",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"Accept-Encoding": {"foo"},
+			},
+			health:  probe.Success,
+			accBody: "Accept-Encoding: foo",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"Accept-Encoding": {""},
+			},
+			health:  probe.Success,
+			accBody: "Accept-Encoding: \n",
 		},
 		{
 			handler: headerEchoHandler,
@@ -168,6 +230,64 @@ func TestHTTPProbeChecker(t *testing.T) {
 			reqHeaders: http.Header{},
 			health:     probe.Success,
 			accBody:    "User-Agent: kube-probe/",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"User-Agent": {"foo/1.0"},
+				"Accept":     {"text/html"},
+			},
+			health:  probe.Success,
+			accBody: "Accept: text/html",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"User-Agent": {"foo/1.0"},
+				"Accept":     {"foo/*"},
+			},
+			health:  probe.Success,
+			accBody: "User-Agent: foo/1.0",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"X-Muffins-Or-Cupcakes": {"muffins"},
+				"Accept":                {"foo/*"},
+			},
+			health:  probe.Success,
+			accBody: "X-Muffins-Or-Cupcakes: muffins",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"Accept": {"foo/*"},
+			},
+			health:  probe.Success,
+			accBody: "Accept: foo/*",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"Accept": {""},
+			},
+			health:  probe.Success,
+			notBody: "Accept:",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"User-Agent": {"foo/1.0"},
+				"Accept":     {""},
+			},
+			health:  probe.Success,
+			notBody: "Accept:",
+		},
+		{
+			handler:    headerEchoHandler,
+			reqHeaders: http.Header{},
+			health:     probe.Success,
+			accBody:    "Accept: */*",
 		},
 		{
 			// Echo handler that returns the contents of Host in the body
@@ -226,6 +346,16 @@ func TestHTTPProbeChecker(t *testing.T) {
 		{
 			handler: redirectHandler(http.StatusPermanentRedirect, true), // 308
 			health:  probe.Failure,
+		},
+		{
+			handler: redirectHandlerWithBody(http.StatusPermanentRedirect, ""), // redirect with empty body
+			health:  probe.Warning,
+			accBody: "Probe terminated redirects, Response body:",
+		},
+		{
+			handler: redirectHandlerWithBody(http.StatusPermanentRedirect, "ok body"), // redirect with body
+			health:  probe.Warning,
+			accBody: "Probe terminated redirects, Response body: ok body",
 		},
 	}
 	for i, test := range testCases {
@@ -399,8 +529,8 @@ func TestHTTPProbeChecker_PayloadTruncated(t *testing.T) {
 		require.NoError(t, err)
 		result, body, err := prober.Probe(target, headers, wait.ForeverTestTimeout)
 		assert.NoError(t, err)
-		assert.Equal(t, result, probe.Success)
-		assert.Equal(t, body, string(truncatedPayload))
+		assert.Equal(t, probe.Success, result)
+		assert.Equal(t, string(truncatedPayload), body)
 	})
 }
 
@@ -432,7 +562,7 @@ func TestHTTPProbeChecker_PayloadNormal(t *testing.T) {
 		require.NoError(t, err)
 		result, body, err := prober.Probe(target, headers, wait.ForeverTestTimeout)
 		assert.NoError(t, err)
-		assert.Equal(t, result, probe.Success)
-		assert.Equal(t, body, string(normalPayload))
+		assert.Equal(t, probe.Success, result)
+		assert.Equal(t, string(normalPayload), body)
 	})
 }

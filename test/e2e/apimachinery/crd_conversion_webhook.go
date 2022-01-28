@@ -139,7 +139,7 @@ var _ = SIGDescribe("CustomResourceConversionWebhook [Privileged:ClusterAdmin]",
 	})
 
 	/*
-		Release : v1.16
+		Release: v1.16
 		Testname: Custom Resource Definition Conversion Webhook, conversion custom resource
 		Description: Register a conversion webhook and a custom resource definition. Create a v1 custom
 		resource. Attempts to read it at v2 MUST succeed.
@@ -173,7 +173,7 @@ var _ = SIGDescribe("CustomResourceConversionWebhook [Privileged:ClusterAdmin]",
 	})
 
 	/*
-		Release : v1.16
+		Release: v1.16
 		Testname: Custom Resource Definition Conversion Webhook, convert mixed version list
 		Description: Register a conversion webhook and a custom resource definition. Create a custom resource stored at
 		v1. Change the custom resource definition storage to v2. Create a custom resource stored at v2. Attempt to list
@@ -266,7 +266,6 @@ func deployCustomResourceWebhookAndService(f *framework.Framework, image string,
 	// Create the deployment of the webhook
 	podLabels := map[string]string{"app": "sample-crd-conversion-webhook", "crd-webhook": "true"}
 	replicas := int32(1)
-	zero := int64(0)
 	mounts := []v1.VolumeMount{
 		{
 			Name:      "crd-conversion-webhook-certs",
@@ -296,7 +295,7 @@ func deployCustomResourceWebhookAndService(f *framework.Framework, image string,
 				fmt.Sprintf("--port=%d", containerPort),
 			},
 			ReadinessProbe: &v1.Probe{
-				Handler: v1.Handler{
+				ProbeHandler: v1.ProbeHandler{
 					HTTPGet: &v1.HTTPGetAction{
 						Scheme: v1.URISchemeHTTPS,
 						Port:   intstr.FromInt(int(containerPort)),
@@ -311,31 +310,10 @@ func deployCustomResourceWebhookAndService(f *framework.Framework, image string,
 			Ports: []v1.ContainerPort{{ContainerPort: containerPort}},
 		},
 	}
-	d := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   deploymentCRDName,
-			Labels: podLabels,
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: podLabels,
-			},
-			Strategy: appsv1.DeploymentStrategy{
-				Type: appsv1.RollingUpdateDeploymentStrategyType,
-			},
-			Template: v1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: podLabels,
-				},
-				Spec: v1.PodSpec{
-					TerminationGracePeriodSeconds: &zero,
-					Containers:                    containers,
-					Volumes:                       volumes,
-				},
-			},
-		},
-	}
+	d := e2edeployment.NewDeployment(deploymentCRDName, replicas, podLabels, "", "", appsv1.RollingUpdateDeploymentStrategyType)
+	d.Spec.Template.Spec.Containers = containers
+	d.Spec.Template.Spec.Volumes = volumes
+
 	deployment, err := client.AppsV1().Deployments(namespace).Create(context.TODO(), d, metav1.CreateOptions{})
 	framework.ExpectNoError(err, "creating deployment %s in namespace %s", deploymentCRDName, namespace)
 
@@ -415,7 +393,7 @@ func testCustomResourceConversionWebhook(f *framework.Framework, crd *apiextensi
 		},
 	}
 	_, err := customResourceClients["v1"].Create(context.TODO(), crInstance, metav1.CreateOptions{})
-	gomega.Expect(err).To(gomega.BeNil())
+	framework.ExpectNoError(err)
 	ginkgo.By("v2 custom resource should be converted")
 	v2crd, err := customResourceClients["v2"].Get(context.TODO(), name, metav1.GetOptions{})
 	framework.ExpectNoError(err, "Getting v2 of custom resource %s", name)
@@ -440,13 +418,13 @@ func testCRListConversion(f *framework.Framework, testCrd *crd.TestCrd) {
 		},
 	}
 	_, err := customResourceClients["v1"].Create(context.TODO(), crInstance, metav1.CreateOptions{})
-	gomega.Expect(err).To(gomega.BeNil())
+	framework.ExpectNoError(err)
 
 	// Now cr-instance-1 is stored as v1. lets change storage version
 	crd, err = integration.UpdateV1CustomResourceDefinitionWithRetry(testCrd.APIExtensionClient, crd.Name, func(c *apiextensionsv1.CustomResourceDefinition) {
 		c.Spec.Versions = alternativeAPIVersions
 	})
-	gomega.Expect(err).To(gomega.BeNil())
+	framework.ExpectNoError(err)
 	ginkgo.By("Create a v2 custom resource")
 	crInstance = &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -471,13 +449,13 @@ func testCRListConversion(f *framework.Framework, testCrd *crd.TestCrd) {
 			break
 		}
 	}
-	gomega.Expect(err).To(gomega.BeNil())
+	framework.ExpectNoError(err)
 
 	// Now that we have a v1 and v2 object, both list operation in v1 and v2 should work as expected.
 
 	ginkgo.By("List CRs in v1")
 	list, err := customResourceClients["v1"].List(context.TODO(), metav1.ListOptions{})
-	gomega.Expect(err).To(gomega.BeNil())
+	framework.ExpectNoError(err)
 	gomega.Expect(len(list.Items)).To(gomega.BeIdenticalTo(2))
 	framework.ExpectEqual((list.Items[0].GetName() == name1 && list.Items[1].GetName() == name2) ||
 		(list.Items[0].GetName() == name2 && list.Items[1].GetName() == name1), true)
@@ -486,7 +464,7 @@ func testCRListConversion(f *framework.Framework, testCrd *crd.TestCrd) {
 
 	ginkgo.By("List CRs in v2")
 	list, err = customResourceClients["v2"].List(context.TODO(), metav1.ListOptions{})
-	gomega.Expect(err).To(gomega.BeNil())
+	framework.ExpectNoError(err)
 	gomega.Expect(len(list.Items)).To(gomega.BeIdenticalTo(2))
 	framework.ExpectEqual((list.Items[0].GetName() == name1 && list.Items[1].GetName() == name2) ||
 		(list.Items[0].GetName() == name2 && list.Items[1].GetName() == name1), true)

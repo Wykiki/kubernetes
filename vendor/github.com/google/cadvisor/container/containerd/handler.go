@@ -21,17 +21,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerd/containerd/errdefs"
-	cgroupfs "github.com/opencontainers/runc/libcontainer/cgroups/fs"
-	libcontainerconfigs "github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/google/cadvisor/container/containerd/errdefs"
+	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"golang.org/x/net/context"
+
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/google/cadvisor/container"
 	"github.com/google/cadvisor/container/common"
 	containerlibcontainer "github.com/google/cadvisor/container/libcontainer"
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 type containerdContainerHandler struct {
@@ -60,20 +60,18 @@ func newContainerdContainerHandler(
 	name string,
 	machineInfoFactory info.MachineInfoFactory,
 	fsInfo fs.FsInfo,
-	cgroupSubsystems *containerlibcontainer.CgroupSubsystems,
+	cgroupSubsystems map[string]string,
 	inHostNamespace bool,
-	metadataEnvs []string,
+	metadataEnvAllowList []string,
 	includedMetrics container.MetricSet,
 ) (container.ContainerHandler, error) {
 	// Create the cgroup paths.
-	cgroupPaths := common.MakeCgroupPaths(cgroupSubsystems.MountPoints, name)
+	cgroupPaths := common.MakeCgroupPaths(cgroupSubsystems, name)
 
 	// Generate the equivalent cgroup manager for this container.
-	cgroupManager := &cgroupfs.Manager{
-		Cgroups: &libcontainerconfigs.Cgroup{
-			Name: name,
-		},
-		Paths: cgroupPaths,
+	cgroupManager, err := containerlibcontainer.NewCgroupManager(name, cgroupPaths)
+	if err != nil {
+		return nil, err
 	}
 
 	id := ContainerNameToContainerdID(name)
@@ -137,11 +135,19 @@ func newContainerdContainerHandler(
 	}
 	// Add the name and bare ID as aliases of the container.
 	handler.image = cntr.Image
-	for _, envVar := range spec.Process.Env {
-		if envVar != "" {
-			splits := strings.SplitN(envVar, "=", 2)
-			if len(splits) == 2 {
-				handler.envs[splits[0]] = splits[1]
+
+	for _, exposedEnv := range metadataEnvAllowList {
+		if exposedEnv == "" {
+			// if no containerdEnvWhitelist provided, len(metadataEnvAllowList) == 1, metadataEnvAllowList[0] == ""
+			continue
+		}
+
+		for _, envVar := range spec.Process.Env {
+			if envVar != "" {
+				splits := strings.SplitN(envVar, "=", 2)
+				if len(splits) == 2 && strings.HasPrefix(splits[0], exposedEnv) {
+					handler.envs[splits[0]] = splits[1]
+				}
 			}
 		}
 	}
@@ -211,7 +217,11 @@ func (h *containerdContainerHandler) ListContainers(listType container.ListType)
 }
 
 func (h *containerdContainerHandler) GetCgroupPath(resource string) (string, error) {
-	path, ok := h.cgroupPaths[resource]
+	var res string
+	if !cgroups.IsCgroup2UnifiedMode() {
+		res = resource
+	}
+	path, ok := h.cgroupPaths[res]
 	if !ok {
 		return "", fmt.Errorf("could not find path for resource %q for container %q", resource, h.reference.Name)
 	}

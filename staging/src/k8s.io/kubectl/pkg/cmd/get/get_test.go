@@ -19,7 +19,6 @@ package get
 import (
 	"bytes"
 	"encoding/json"
-	encjson "encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -55,7 +54,6 @@ import (
 )
 
 var (
-	openapiSchemaPath  = filepath.Join("..", "..", "..", "testdata", "openapi", "swagger.json")
 	grace              = int64(30)
 	enableServiceLinks = corev1.DefaultEnableServiceLinks
 )
@@ -90,6 +88,7 @@ func testComponentStatusData() *corev1.ComponentStatusList {
 // Verifies that schemas that are not in the master tree of Kubernetes can be retrieved via Get.
 func TestGetUnknownSchemaObject(t *testing.T) {
 	t.Skip("This test is completely broken.  The first thing it does is add the object to the scheme!")
+	var openapiSchemaPath = filepath.Join("..", "..", "..", "testdata", "openapi", "swagger.json")
 	tf := cmdtesting.NewTestFactory().WithNamespace("test")
 	defer tf.Cleanup()
 	_, _, codec := cmdtesting.NewExternalScheme()
@@ -124,13 +123,13 @@ func TestGetUnknownSchemaObject(t *testing.T) {
 	for i, obj := range actual {
 		expectedJSON := runtime.EncodeOrDie(codec, expected[i])
 		expectedMap := map[string]interface{}{}
-		if err := encjson.Unmarshal([]byte(expectedJSON), &expectedMap); err != nil {
+		if err := json.Unmarshal([]byte(expectedJSON), &expectedMap); err != nil {
 			t.Fatal(err)
 		}
 
 		actualJSON := runtime.EncodeOrDie(codec, obj)
 		actualMap := map[string]interface{}{}
-		if err := encjson.Unmarshal([]byte(actualJSON), &actualMap); err != nil {
+		if err := json.Unmarshal([]byte(actualJSON), &actualMap); err != nil {
 			t.Fatal(err)
 		}
 
@@ -860,7 +859,7 @@ func TestGetSortedObjects(t *testing.T) {
 	cmd := NewCmdGet("kubectl", tf, streams)
 	cmd.SetOutput(buf)
 
-	// sorting with metedata.name
+	// sorting with metadata.name
 	cmd.Flags().Set("sort-by", ".metadata.name")
 	cmd.Run(cmd, []string{"pods"})
 
@@ -879,7 +878,7 @@ func TestGetSortedObjectsUnstructuredTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	unstructuredBytes, err := encjson.MarshalIndent(unstructuredMap, "", "  ")
+	unstructuredBytes, err := json.MarshalIndent(unstructuredMap, "", "  ")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -899,7 +898,7 @@ func TestGetSortedObjectsUnstructuredTable(t *testing.T) {
 	cmd := NewCmdGet("kubectl", tf, streams)
 	cmd.SetOutput(buf)
 
-	// sorting with metedata.name
+	// sorting with metadata.name
 	cmd.Flags().Set("sort-by", ".metadata.name")
 	cmd.Run(cmd, []string{"pods"})
 

@@ -24,7 +24,6 @@ import (
 	"time"
 
 	restful "github.com/emicklei/go-restful"
-	"github.com/go-openapi/spec"
 
 	"k8s.io/klog/v2"
 
@@ -34,6 +33,7 @@ import (
 	"k8s.io/kube-openapi/pkg/builder"
 	"k8s.io/kube-openapi/pkg/common"
 	"k8s.io/kube-openapi/pkg/handler"
+	"k8s.io/kube-openapi/pkg/validation/spec"
 )
 
 // SpecAggregator calls out to http handlers of APIServices and merges specs. It keeps state of the last
@@ -96,6 +96,12 @@ func BuildAndRegisterAggregator(downloader *Downloader, delegationTarget server.
 		}
 		delegateSpec, etag, _, err := downloader.Download(handler, "")
 		if err != nil {
+			// ignore errors for the empty delegate we attach at the end the chain
+			// atm the empty delegate returns 503 when the server hasn't been fully initialized
+			// and the spec downloader only silences 404s
+			if len(delegate.ListedPaths()) == 0 && delegate.NextDelegate() == nil {
+				continue
+			}
 			return nil, err
 		}
 		if delegateSpec == nil {
@@ -175,7 +181,12 @@ func (s *specAggregator) buildOpenAPISpec() (specToReturn *spec.Swagger, err err
 		if specInfo.spec == nil {
 			continue
 		}
-		specs = append(specs, *specInfo)
+		// Copy the spec before removing the defaults.
+		localSpec := *specInfo.spec
+		localSpecInfo := *specInfo
+		localSpecInfo.spec = &localSpec
+		localSpecInfo.spec.Definitions = handler.PruneDefaults(specInfo.spec.Definitions)
+		specs = append(specs, localSpecInfo)
 	}
 	if len(specs) == 0 {
 		return &spec.Swagger{}, nil

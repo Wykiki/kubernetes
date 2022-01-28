@@ -34,9 +34,9 @@ import (
 )
 
 // Creates a cacher based given storageConfig.
-func StorageWithCacher(capacity int) generic.StorageDecorator {
+func StorageWithCacher() generic.StorageDecorator {
 	return func(
-		storageConfig *storagebackend.Config,
+		storageConfig *storagebackend.ConfigForResource,
 		resourcePrefix string,
 		keyFunc func(obj runtime.Object) (string, error),
 		newFunc func() runtime.Object,
@@ -45,22 +45,15 @@ func StorageWithCacher(capacity int) generic.StorageDecorator {
 		triggerFuncs storage.IndexerFuncs,
 		indexers *cache.Indexers) (storage.Interface, factory.DestroyFunc, error) {
 
-		s, d, err := generic.NewRawStorage(storageConfig)
+		s, d, err := generic.NewRawStorage(storageConfig, newFunc)
 		if err != nil {
 			return s, d, err
 		}
-		if capacity <= 0 {
-			klog.V(5).Infof("Storage caching is disabled for %s", objectTypeToString(newFunc()))
-			return s, d, nil
-		}
 		if klog.V(5).Enabled() {
-			klog.Infof("Storage caching is enabled for %s with capacity %v", objectTypeToString(newFunc()), capacity)
+			klog.V(5).InfoS("Storage caching is enabled", objectTypeToArgs(newFunc())...)
 		}
 
-		// TODO: we would change this later to make storage always have cacher and hide low level KV layer inside.
-		// Currently it has two layers of same storage interface -- cacher and low level kv.
 		cacherConfig := cacherstorage.Config{
-			CacheCapacity:  capacity,
 			Storage:        s,
 			Versioner:      etcd3.APIObjectVersioner{},
 			ResourcePrefix: resourcePrefix,
@@ -90,15 +83,16 @@ func StorageWithCacher(capacity int) generic.StorageDecorator {
 	}
 }
 
-func objectTypeToString(obj runtime.Object) string {
+func objectTypeToArgs(obj runtime.Object) []interface{} {
 	// special-case unstructured objects that tell us their apiVersion/kind
 	if u, isUnstructured := obj.(*unstructured.Unstructured); isUnstructured {
 		if apiVersion, kind := u.GetAPIVersion(), u.GetKind(); len(apiVersion) > 0 && len(kind) > 0 {
-			return fmt.Sprintf("apiVersion=%s, kind=%s", apiVersion, kind)
+			return []interface{}{"apiVersion", apiVersion, "kind", kind}
 		}
 	}
+
 	// otherwise just return the type
-	return fmt.Sprintf("%T", obj)
+	return []interface{}{"type", fmt.Sprintf("%T", obj)}
 }
 
 // TODO : Remove all the code below when PR

@@ -37,6 +37,7 @@ import (
 	"k8s.io/kubernetes/pkg/security/apparmor"
 	"k8s.io/kubernetes/pkg/security/podsecuritypolicy/seccomp"
 	psputil "k8s.io/kubernetes/pkg/security/podsecuritypolicy/util"
+	"k8s.io/kubernetes/plugin/pkg/admission/serviceaccount"
 	"k8s.io/utils/pointer"
 )
 
@@ -103,6 +104,8 @@ func TestMutatePodNonmutating(t *testing.T) {
 }
 
 func TestMutateContainerNonmutating(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.EphemeralContainers, true)()
+
 	untrue := false
 	tests := []struct {
 		security *api.SecurityContext
@@ -118,6 +121,11 @@ func TestMutateContainerNonmutating(t *testing.T) {
 				Spec: api.PodSpec{
 					Containers: []api.Container{{
 						SecurityContext: tc.security,
+					}},
+					EphemeralContainers: []api.EphemeralContainer{{
+						EphemeralContainerCommon: api.EphemeralContainerCommon{
+							SecurityContext: tc.security,
+						},
 					}},
 				},
 			}
@@ -345,6 +353,18 @@ func TestValidatePodFailures(t *testing.T) {
 		},
 	}
 
+	failGenericEphemeralPod := defaultPod()
+	failGenericEphemeralPod.Spec.Volumes = []api.Volume{
+		{
+			Name: "generic ephemeral volume",
+			VolumeSource: api.VolumeSource{
+				Ephemeral: &api.EphemeralVolumeSource{
+					VolumeClaimTemplate: &api.PersistentVolumeClaimTemplate{},
+				},
+			},
+		},
+	}
+
 	errorCases := map[string]struct {
 		pod           *api.Pod
 		psp           *policy.PodSecurityPolicy
@@ -484,6 +504,20 @@ func TestValidatePodFailures(t *testing.T) {
 			psp:           defaultPSP(),
 			expectedError: "csi volumes are not allowed to be used",
 		},
+		"generic ephemeral volumes without proper policy set": {
+			pod:           failGenericEphemeralPod,
+			psp:           defaultPSP(),
+			expectedError: "ephemeral volumes are not allowed to be used",
+		},
+		"generic ephemeral volumes with other volume type allowed": {
+			pod: failGenericEphemeralPod,
+			psp: func() *policy.PodSecurityPolicy {
+				psp := defaultPSP()
+				psp.Spec.Volumes = []policy.FSType{policy.NFS}
+				return psp
+			}(),
+			expectedError: "ephemeral volumes are not allowed to be used",
+		},
 	}
 	for name, test := range errorCases {
 		t.Run(name, func(t *testing.T) {
@@ -519,6 +553,8 @@ func allowFlexVolumesPSP(allowAllFlexVolumes, allowAllVolumes bool) *policy.PodS
 }
 
 func TestValidateContainerFailures(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.EphemeralContainers, true)()
+
 	// fail user strategy
 	failUserPSP := defaultPSP()
 	uid := int64(999)
@@ -661,6 +697,13 @@ func TestValidateContainerFailures(t *testing.T) {
 			require.NoError(t, err, "unable to create provider")
 			errs := provider.ValidatePod(test.pod)
 			require.NotEmpty(t, errs, "expected validation failure but did not receive errors")
+			assert.Contains(t, errs[0].Error(), test.expectedError, "unexpected error")
+
+			// We want EphemeralContainers to behave the same as regular containers, so move the
+			// containers to ephemeralContainers and validate again.
+			ecPod := moveContainersToEphemeral(test.pod)
+			errs = provider.ValidatePod(ecPod)
+			require.NotEmpty(t, errs, "expected validation failure for ephemeral containers but did not receive errors")
 			assert.Contains(t, errs[0].Error(), test.expectedError, "unexpected error")
 		})
 	}
@@ -887,6 +930,18 @@ func TestValidatePodSuccess(t *testing.T) {
 		},
 	}
 
+	genericEphemeralPod := defaultPod()
+	genericEphemeralPod.Spec.Volumes = []api.Volume{
+		{
+			Name: "generic ephemeral volume",
+			VolumeSource: api.VolumeSource{
+				Ephemeral: &api.EphemeralVolumeSource{
+					VolumeClaimTemplate: &api.PersistentVolumeClaimTemplate{},
+				},
+			},
+		},
+	}
+
 	successCases := map[string]struct {
 		pod *api.Pod
 		psp *policy.PodSecurityPolicy
@@ -951,19 +1006,19 @@ func TestValidatePodSuccess(t *testing.T) {
 			pod: seccompPod,
 			psp: seccompPSP,
 		},
-		"flex volume driver in a whitelist (all volumes are allowed)": {
+		"flex volume driver in a allowlist (all volumes are allowed)": {
 			pod: flexVolumePod,
 			psp: allowFlexVolumesPSP(false, true),
 		},
-		"flex volume driver with empty whitelist (all volumes are allowed)": {
+		"flex volume driver with empty allowlist (all volumes are allowed)": {
 			pod: flexVolumePod,
 			psp: allowFlexVolumesPSP(true, true),
 		},
-		"flex volume driver in a whitelist (only flex volumes are allowed)": {
+		"flex volume driver in a allowlist (only flex volumes are allowed)": {
 			pod: flexVolumePod,
 			psp: allowFlexVolumesPSP(false, false),
 		},
-		"flex volume driver with empty whitelist (only flex volumes volumes are allowed)": {
+		"flex volume driver with empty allowlist (only flex volumes volumes are allowed)": {
 			pod: flexVolumePod,
 			psp: allowFlexVolumesPSP(true, false),
 		},
@@ -994,6 +1049,22 @@ func TestValidatePodSuccess(t *testing.T) {
 				return psp
 			}(),
 		},
+		"generic ephemeral volume policy with generic ephemeral volume used": {
+			pod: genericEphemeralPod,
+			psp: func() *policy.PodSecurityPolicy {
+				psp := defaultPSP()
+				psp.Spec.Volumes = []policy.FSType{policy.Ephemeral}
+				return psp
+			}(),
+		},
+		"policy.All with generic ephemeral volume used": {
+			pod: genericEphemeralPod,
+			psp: func() *policy.PodSecurityPolicy {
+				psp := defaultPSP()
+				psp.Spec.Volumes = []policy.FSType{policy.All}
+				return psp
+			}(),
+		},
 	}
 
 	for name, test := range successCases {
@@ -1007,6 +1078,8 @@ func TestValidatePodSuccess(t *testing.T) {
 }
 
 func TestValidateContainerSuccess(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.EphemeralContainers, true)()
+
 	// success user strategy
 	userPSP := defaultPSP()
 	uid := int64(999)
@@ -1166,6 +1239,12 @@ func TestValidateContainerSuccess(t *testing.T) {
 			require.NoError(t, err, "unable to create provider")
 			errs := provider.ValidatePod(test.pod)
 			assert.Empty(t, errs, "expected validation pass but received errors")
+
+			// We want EphemeralContainers to behave the same as regular containers, so move the
+			// containers to ephemeralContainers and validate again.
+			ecPod := moveContainersToEphemeral(test.pod)
+			errs = provider.ValidatePod(ecPod)
+			assert.Empty(t, errs, "expected validation pass for ephemeral containers but received errors")
 		})
 	}
 }
@@ -1322,6 +1401,17 @@ func defaultV1Pod() *v1.Pod {
 	}
 }
 
+func moveContainersToEphemeral(in *api.Pod) *api.Pod {
+	out := in.DeepCopy()
+	for _, c := range out.Spec.Containers {
+		out.Spec.EphemeralContainers = append(out.Spec.EphemeralContainers, api.EphemeralContainer{
+			EphemeralContainerCommon: api.EphemeralContainerCommon(c),
+		})
+	}
+	out.Spec.Containers = nil
+	return out
+}
+
 // TestValidateAllowedVolumes will test that for every field of VolumeSource we can create
 // a pod with that type of volume and deny it, accept it explicitly, or accept it with
 // the FSTypeAll wildcard.
@@ -1373,7 +1463,69 @@ func TestValidateAllowedVolumes(t *testing.T) {
 	}
 }
 
+func TestValidateProjectedVolume(t *testing.T) {
+	pod := defaultPod()
+	psp := defaultPSP()
+	provider, err := NewSimpleProvider(psp, "namespace", NewSimpleStrategyFactory())
+	require.NoError(t, err, "error creating provider")
+
+	tests := []struct {
+		desc                  string
+		allowedFSTypes        []policy.FSType
+		projectedVolumeSource *api.ProjectedVolumeSource
+		wantAllow             bool
+	}{
+		{
+			desc:                  "deny if secret is not allowed",
+			allowedFSTypes:        []policy.FSType{policy.EmptyDir},
+			projectedVolumeSource: serviceaccount.TokenVolumeSource(),
+			wantAllow:             false,
+		},
+		{
+			desc:           "deny if the projected volume has volume source other than the ones in projected volume injected by service account token admission plugin",
+			allowedFSTypes: []policy.FSType{policy.Secret},
+			projectedVolumeSource: &api.ProjectedVolumeSource{
+				Sources: []api.VolumeProjection{
+					{
+						ConfigMap: &api.ConfigMapProjection{
+							LocalObjectReference: api.LocalObjectReference{
+								Name: "foo-ca.crt",
+							},
+							Items: []api.KeyToPath{
+								{
+									Key:  "ca.crt",
+									Path: "ca.crt",
+								},
+							},
+						},
+					},
+				}},
+			wantAllow: false,
+		},
+		{
+			desc:                  "allow if secret is allowed and the projected volume sources equals to the ones injected by service account admission plugin",
+			allowedFSTypes:        []policy.FSType{policy.Secret},
+			projectedVolumeSource: serviceaccount.TokenVolumeSource(),
+			wantAllow:             true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			pod.Spec.Volumes = []api.Volume{{VolumeSource: api.VolumeSource{Projected: test.projectedVolumeSource}}}
+			psp.Spec.Volumes = test.allowedFSTypes
+			errs := provider.ValidatePod(pod)
+			if test.wantAllow {
+				assert.Empty(t, errs, "projected volumes are allowed")
+			} else {
+				assert.Contains(t, errs.ToAggregate().Error(), fmt.Sprintf("projected volumes are not allowed to be used"), "did not find the expected error")
+			}
+		})
+	}
+}
+
 func TestAllowPrivilegeEscalation(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.EphemeralContainers, true)()
+
 	ptr := pointer.BoolPtr
 	tests := []struct {
 		pspAPE    bool  // PSP AllowPrivilegeEscalation
@@ -1412,6 +1564,7 @@ func TestAllowPrivilegeEscalation(t *testing.T) {
 		t.Run(fmt.Sprintf("pspAPE:%t_pspDAPE:%s_podAPE:%s", test.pspAPE, fmtPtr(test.pspDAPE), fmtPtr(test.podAPE)), func(t *testing.T) {
 			pod := defaultPod()
 			pod.Spec.Containers[0].SecurityContext.AllowPrivilegeEscalation = test.podAPE
+			ecPod := moveContainersToEphemeral(pod)
 
 			psp := defaultPSP()
 			psp.Spec.AllowPrivilegeEscalation = &test.pspAPE
@@ -1430,6 +1583,18 @@ func TestAllowPrivilegeEscalation(t *testing.T) {
 				assert.Empty(t, errs, "expected no validation errors")
 				ape := pod.Spec.Containers[0].SecurityContext.AllowPrivilegeEscalation
 				assert.Equal(t, test.expectAPE, ape, "expected pod AllowPrivilegeEscalation")
+			}
+
+			err = provider.MutatePod(ecPod)
+			require.NoError(t, err)
+
+			errs = provider.ValidatePod(ecPod)
+			if test.expectErr {
+				assert.NotEmpty(t, errs, "expected validation error for ephemeral containers")
+			} else {
+				assert.Empty(t, errs, "expected no validation errors for ephemeral containers")
+				ape := ecPod.Spec.EphemeralContainers[0].SecurityContext.AllowPrivilegeEscalation
+				assert.Equal(t, test.expectAPE, ape, "expected pod AllowPrivilegeEscalation for ephemeral container")
 			}
 		})
 	}

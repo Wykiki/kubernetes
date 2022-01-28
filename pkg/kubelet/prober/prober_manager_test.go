@@ -25,24 +25,18 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/features"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/prober/results"
 	"k8s.io/kubernetes/pkg/probe"
 )
 
 func init() {
-	runtime.ReallyCrash = true
 }
 
 var defaultProbe = &v1.Probe{
-	Handler: v1.Handler{
+	ProbeHandler: v1.ProbeHandler{
 		Exec: &v1.ExecAction{},
 	},
 	TimeoutSeconds:   1,
@@ -92,7 +86,6 @@ func TestAddRemovePods(t *testing.T) {
 	}
 
 	m := newTestManager()
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.StartupProbe, true)()
 	defer cleanup(t, m)
 	if err := expectProbes(m, nil); err != nil {
 		t.Error(err)
@@ -123,7 +116,7 @@ func TestAddRemovePods(t *testing.T) {
 
 	// Removing probed pod.
 	m.RemovePod(&probePod)
-	if err := waitForWorkerExit(m, probePaths); err != nil {
+	if err := waitForWorkerExit(t, m, probePaths); err != nil {
 		t.Fatal(err)
 	}
 	if err := expectProbes(m, nil); err != nil {
@@ -139,7 +132,6 @@ func TestAddRemovePods(t *testing.T) {
 
 func TestCleanupPods(t *testing.T) {
 	m := newTestManager()
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.StartupProbe, true)()
 	defer cleanup(t, m)
 	podToCleanup := v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -192,7 +184,7 @@ func TestCleanupPods(t *testing.T) {
 		{"pod_keep", "prober2", liveness},
 		{"pod_keep", "prober3", startup},
 	}
-	if err := waitForWorkerExit(m, removedProbes); err != nil {
+	if err := waitForWorkerExit(t, m, removedProbes); err != nil {
 		t.Fatal(err)
 	}
 	if err := expectProbes(m, expectedProbes); err != nil {
@@ -202,7 +194,6 @@ func TestCleanupPods(t *testing.T) {
 
 func TestCleanupRepeated(t *testing.T) {
 	m := newTestManager()
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.StartupProbe, true)()
 	defer cleanup(t, m)
 	podTemplate := v1.Pod{
 		Spec: v1.PodSpec{
@@ -256,6 +247,20 @@ func TestUpdatePodStatus(t *testing.T) {
 			Running: &v1.ContainerStateRunning{},
 		},
 	}
+	notStartedNoReadiness := v1.ContainerStatus{
+		Name:        "not_started_container_no_readiness",
+		ContainerID: "test://not_started_container_no_readiness_id",
+		State: v1.ContainerState{
+			Running: &v1.ContainerStateRunning{},
+		},
+	}
+	startedNoReadiness := v1.ContainerStatus{
+		Name:        "started_container_no_readiness",
+		ContainerID: "test://started_container_no_readiness_id",
+		State: v1.ContainerState{
+			Running: &v1.ContainerStateRunning{},
+		},
+	}
 	terminated := v1.ContainerStatus{
 		Name:        "terminated_container",
 		ContainerID: "test://terminated_container_id",
@@ -266,7 +271,7 @@ func TestUpdatePodStatus(t *testing.T) {
 	podStatus := v1.PodStatus{
 		Phase: v1.PodRunning,
 		ContainerStatuses: []v1.ContainerStatus{
-			unprobed, probedReady, probedPending, probedUnready, terminated,
+			unprobed, probedReady, probedPending, probedUnready, notStartedNoReadiness, startedNoReadiness, terminated,
 		},
 	}
 
@@ -275,24 +280,29 @@ func TestUpdatePodStatus(t *testing.T) {
 
 	// Setup probe "workers" and cached results.
 	m.workers = map[probeKey]*worker{
-		{testPodUID, unprobed.Name, liveness}:       {},
-		{testPodUID, probedReady.Name, readiness}:   {},
-		{testPodUID, probedPending.Name, readiness}: {},
-		{testPodUID, probedUnready.Name, readiness}: {},
-		{testPodUID, terminated.Name, readiness}:    {},
+		{testPodUID, unprobed.Name, liveness}:             {},
+		{testPodUID, probedReady.Name, readiness}:         {},
+		{testPodUID, probedPending.Name, readiness}:       {},
+		{testPodUID, probedUnready.Name, readiness}:       {},
+		{testPodUID, notStartedNoReadiness.Name, startup}: {},
+		{testPodUID, startedNoReadiness.Name, startup}:    {},
+		{testPodUID, terminated.Name, readiness}:          {},
 	}
 	m.readinessManager.Set(kubecontainer.ParseContainerID(probedReady.ContainerID), results.Success, &v1.Pod{})
 	m.readinessManager.Set(kubecontainer.ParseContainerID(probedUnready.ContainerID), results.Failure, &v1.Pod{})
+	m.startupManager.Set(kubecontainer.ParseContainerID(startedNoReadiness.ContainerID), results.Success, &v1.Pod{})
 	m.readinessManager.Set(kubecontainer.ParseContainerID(terminated.ContainerID), results.Success, &v1.Pod{})
 
 	m.UpdatePodStatus(testPodUID, &podStatus)
 
 	expectedReadiness := map[probeKey]bool{
-		{testPodUID, unprobed.Name, readiness}:      true,
-		{testPodUID, probedReady.Name, readiness}:   true,
-		{testPodUID, probedPending.Name, readiness}: false,
-		{testPodUID, probedUnready.Name, readiness}: false,
-		{testPodUID, terminated.Name, readiness}:    false,
+		{testPodUID, unprobed.Name, readiness}:              true,
+		{testPodUID, probedReady.Name, readiness}:           true,
+		{testPodUID, probedPending.Name, readiness}:         false,
+		{testPodUID, probedUnready.Name, readiness}:         false,
+		{testPodUID, notStartedNoReadiness.Name, readiness}: false,
+		{testPodUID, startedNoReadiness.Name, readiness}:    true,
+		{testPodUID, terminated.Name, readiness}:            false,
 	}
 	for _, c := range podStatus.ContainerStatuses {
 		expected, ok := expectedReadiness[probeKey{testPodUID, c.Name, readiness}]
@@ -306,6 +316,13 @@ func TestUpdatePodStatus(t *testing.T) {
 	}
 }
 
+func (m *manager) extractedReadinessHandling() {
+	update := <-m.readinessManager.Updates()
+	// This code corresponds to an extract from kubelet.syncLoopIteration()
+	ready := update.Result == results.Success
+	m.statusManager.SetContainerReadiness(update.PodUID, update.ContainerID, ready)
+}
+
 func TestUpdateReadiness(t *testing.T) {
 	testPod := getTestPod()
 	setTestProbe(testPod, readiness, v1.Probe{})
@@ -314,10 +331,10 @@ func TestUpdateReadiness(t *testing.T) {
 
 	// Start syncing readiness without leaking goroutine.
 	stopCh := make(chan struct{})
-	go wait.Until(m.updateReadiness, 0, stopCh)
+	go wait.Until(m.extractedReadinessHandling, 0, stopCh)
 	defer func() {
 		close(stopCh)
-		// Send an update to exit updateReadiness()
+		// Send an update to exit extractedReadinessHandling()
 		m.readinessManager.Set(kubecontainer.ContainerID{}, results.Success, &v1.Pod{})
 	}()
 
@@ -334,7 +351,7 @@ func TestUpdateReadiness(t *testing.T) {
 	}
 
 	// Wait for ready status.
-	if err := waitForReadyStatus(m, true); err != nil {
+	if err := waitForReadyStatus(t, m, true); err != nil {
 		t.Error(err)
 	}
 
@@ -342,7 +359,7 @@ func TestUpdateReadiness(t *testing.T) {
 	exec.set(probe.Failure, nil)
 
 	// Wait for failed status.
-	if err := waitForReadyStatus(m, false); err != nil {
+	if err := waitForReadyStatus(t, m, false); err != nil {
 		t.Error(err)
 	}
 }
@@ -376,7 +393,7 @@ outer:
 const interval = 1 * time.Second
 
 // Wait for the given workers to exit & clean up.
-func waitForWorkerExit(m *manager, workerPaths []probeKey) error {
+func waitForWorkerExit(t *testing.T, m *manager, workerPaths []probeKey) error {
 	for _, w := range workerPaths {
 		condition := func() (bool, error) {
 			_, exists := m.getWorker(w.podUID, w.containerName, w.probeType)
@@ -385,7 +402,7 @@ func waitForWorkerExit(m *manager, workerPaths []probeKey) error {
 		if exited, _ := condition(); exited {
 			continue // Already exited, no need to poll.
 		}
-		klog.Infof("Polling %v", w)
+		t.Logf("Polling %v", w)
 		if err := wait.Poll(interval, wait.ForeverTestTimeout, condition); err != nil {
 			return err
 		}
@@ -395,7 +412,7 @@ func waitForWorkerExit(m *manager, workerPaths []probeKey) error {
 }
 
 // Wait for the given workers to exit & clean up.
-func waitForReadyStatus(m *manager, ready bool) error {
+func waitForReadyStatus(t *testing.T, m *manager, ready bool) error {
 	condition := func() (bool, error) {
 		status, ok := m.statusManager.GetPodStatus(testPodUID)
 		if !ok {
@@ -410,7 +427,7 @@ func waitForReadyStatus(m *manager, ready bool) error {
 		}
 		return status.ContainerStatuses[0].Ready == ready, nil
 	}
-	klog.Infof("Polling for ready state %v", ready)
+	t.Logf("Polling for ready state %v", ready)
 	if err := wait.Poll(interval, wait.ForeverTestTimeout, condition); err != nil {
 		return err
 	}
@@ -425,7 +442,7 @@ func cleanup(t *testing.T, m *manager) {
 	condition := func() (bool, error) {
 		workerCount := m.workerCount()
 		if workerCount > 0 {
-			klog.Infof("Waiting for %d workers to exit...", workerCount)
+			t.Logf("Waiting for %d workers to exit...", workerCount)
 		}
 		return workerCount == 0, nil
 	}

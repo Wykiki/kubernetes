@@ -17,6 +17,7 @@ limitations under the License.
 package resourcequota
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -32,6 +33,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
+	quota "k8s.io/apiserver/pkg/quota/v1"
+	"k8s.io/apiserver/pkg/quota/v1/generic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -39,8 +42,6 @@ import (
 	core "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/kubernetes/pkg/controller"
-	quota "k8s.io/kubernetes/pkg/quota/v1"
-	"k8s.io/kubernetes/pkg/quota/v1/generic"
 	"k8s.io/kubernetes/pkg/quota/v1/install"
 )
 
@@ -102,7 +103,7 @@ func (errorLister) ByNamespace(namespace string) cache.GenericNamespaceLister {
 }
 
 type quotaController struct {
-	*ResourceQuotaController
+	*Controller
 	stop chan struct{}
 }
 
@@ -111,7 +112,7 @@ func setupQuotaController(t *testing.T, kubeClient kubernetes.Interface, lister 
 	quotaConfiguration := install.NewQuotaConfigurationForControllers(lister)
 	alwaysStarted := make(chan struct{})
 	close(alwaysStarted)
-	resourceQuotaControllerOptions := &ResourceQuotaControllerOptions{
+	resourceQuotaControllerOptions := &ControllerOptions{
 		QuotaClient:               kubeClient.CoreV1(),
 		ResourceQuotaInformer:     informerFactory.Core().V1().ResourceQuotas(),
 		ResyncPeriod:              controller.NoResyncPeriodFunc,
@@ -122,7 +123,7 @@ func setupQuotaController(t *testing.T, kubeClient kubernetes.Interface, lister 
 		InformersStarted:          alwaysStarted,
 		InformerFactory:           informerFactory,
 	}
-	qc, err := NewResourceQuotaController(resourceQuotaControllerOptions)
+	qc, err := NewController(resourceQuotaControllerOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -782,7 +783,7 @@ func TestSyncResourceQuota(t *testing.T) {
 		qc := setupQuotaController(t, kubeClient, mockListerForResourceFunc(listersForResourceConfig), mockDiscoveryFunc)
 		defer close(qc.stop)
 
-		if err := qc.syncResourceQuota(&testCase.quota); err != nil {
+		if err := qc.syncResourceQuota(context.TODO(), &testCase.quota); err != nil {
 			if len(testCase.expectedError) == 0 || !strings.Contains(err.Error(), testCase.expectedError) {
 				t.Fatalf("test: %s, unexpected error: %v", testName, err)
 			}
@@ -807,7 +808,7 @@ func TestSyncResourceQuota(t *testing.T) {
 			}
 		}
 		if usage == nil {
-			t.Errorf("test: %s,\nExpected update action usage, got none: actions:\n%v", testName, actions)
+			t.Fatalf("test: %s,\nExpected update action usage, got none: actions:\n%v", testName, actions)
 		}
 
 		// ensure usage is as expected
@@ -1138,7 +1139,7 @@ func expectSyncNotBlocked(fakeDiscoveryClient *fakeServerResources, workerLock *
 	workerLockAcquired := make(chan struct{})
 	go func() {
 		workerLock.Lock()
-		workerLock.Unlock()
+		defer workerLock.Unlock()
 		close(workerLockAcquired)
 	}()
 	select {
@@ -1156,15 +1157,15 @@ type fakeServerResources struct {
 	InterfaceUsedCount int
 }
 
-func (_ *fakeServerResources) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
+func (*fakeServerResources) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
 	return nil, nil
 }
 
-func (_ *fakeServerResources) ServerResources() ([]*metav1.APIResourceList, error) {
+func (*fakeServerResources) ServerResources() ([]*metav1.APIResourceList, error) {
 	return nil, nil
 }
 
-func (_ *fakeServerResources) ServerPreferredResources() ([]*metav1.APIResourceList, error) {
+func (*fakeServerResources) ServerPreferredResources() ([]*metav1.APIResourceList, error) {
 	return nil, nil
 }
 

@@ -18,7 +18,7 @@ package internalversion
 
 import (
 	// These imports are the API groups the client will support.
-	// TODO: Remove these manual install once we don't need legacy scheme in get comman
+	// TODO: Remove these manual install once we don't need legacy scheme in get command
 	_ "k8s.io/kubernetes/pkg/apis/apps/install"
 	_ "k8s.io/kubernetes/pkg/apis/authentication/install"
 	_ "k8s.io/kubernetes/pkg/apis/authorization/install"
@@ -33,6 +33,5 @@ import (
 	_ "k8s.io/kubernetes/pkg/apis/policy/install"
 	_ "k8s.io/kubernetes/pkg/apis/rbac/install"
 	_ "k8s.io/kubernetes/pkg/apis/scheduling/install"
-	_ "k8s.io/kubernetes/pkg/apis/settings/install"
 	_ "k8s.io/kubernetes/pkg/apis/storage/install"
 )

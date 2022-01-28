@@ -18,10 +18,12 @@ package resource
 
 import (
 	"context"
-	"strconv"
+	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -75,28 +77,68 @@ func (m *Helper) WithFieldManager(fieldManager string) *Helper {
 	return m
 }
 
-func (m *Helper) Get(namespace, name string, export bool) (runtime.Object, error) {
+func (m *Helper) Get(namespace, name string) (runtime.Object, error) {
 	req := m.RESTClient.Get().
 		NamespaceIfScoped(namespace, m.NamespaceScoped).
 		Resource(m.Resource).
 		Name(name)
-	if export {
-		// TODO: I should be part of GetOptions
-		req.Param("export", strconv.FormatBool(export))
-	}
 	return req.Do(context.TODO()).Get()
 }
 
-func (m *Helper) List(namespace, apiVersion string, export bool, options *metav1.ListOptions) (runtime.Object, error) {
+func (m *Helper) List(namespace, apiVersion string, options *metav1.ListOptions) (runtime.Object, error) {
 	req := m.RESTClient.Get().
 		NamespaceIfScoped(namespace, m.NamespaceScoped).
 		Resource(m.Resource).
 		VersionedParams(options, metav1.ParameterCodec)
-	if export {
-		// TODO: I should be part of ListOptions
-		req.Param("export", strconv.FormatBool(export))
-	}
 	return req.Do(context.TODO()).Get()
+}
+
+// FollowContinue handles the continue parameter returned by the API server when using list
+// chunking. To take advantage of this, the initial ListOptions provided by the consumer
+// should include a non-zero Limit parameter.
+func FollowContinue(initialOpts *metav1.ListOptions,
+	listFunc func(metav1.ListOptions) (runtime.Object, error)) error {
+	opts := initialOpts
+	for {
+		list, err := listFunc(*opts)
+		if err != nil {
+			return err
+		}
+		nextContinueToken, _ := metadataAccessor.Continue(list)
+		if len(nextContinueToken) == 0 {
+			return nil
+		}
+		opts.Continue = nextContinueToken
+	}
+}
+
+// EnhanceListError augments errors typically returned by List operations with additional context,
+// making sure to retain the StatusError type when applicable.
+func EnhanceListError(err error, opts metav1.ListOptions, subj string) error {
+	if apierrors.IsResourceExpired(err) {
+		return err
+	}
+	if apierrors.IsBadRequest(err) || apierrors.IsNotFound(err) {
+		if se, ok := err.(*apierrors.StatusError); ok {
+			// modify the message without hiding this is an API error
+			if len(opts.LabelSelector) == 0 && len(opts.FieldSelector) == 0 {
+				se.ErrStatus.Message = fmt.Sprintf("Unable to list %q: %v", subj,
+					se.ErrStatus.Message)
+			} else {
+				se.ErrStatus.Message = fmt.Sprintf(
+					"Unable to find %q that match label selector %q, field selector %q: %v", subj,
+					opts.LabelSelector,
+					opts.FieldSelector, se.ErrStatus.Message)
+			}
+			return se
+		}
+		if len(opts.LabelSelector) == 0 && len(opts.FieldSelector) == 0 {
+			return fmt.Errorf("Unable to list %q: %v", subj, err)
+		}
+		return fmt.Errorf("Unable to find %q that match label selector %q, field selector %q: %v",
+			subj, opts.LabelSelector, opts.FieldSelector, err)
+	}
+	return err
 }
 
 func (m *Helper) Watch(namespace, apiVersion string, options *metav1.ListOptions) (watch.Interface, error) {

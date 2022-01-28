@@ -60,7 +60,7 @@ func NewSimpleMetadataClient(scheme *runtime.Scheme, objects ...runtime.Object) 
 		}
 	}
 
-	cs := &FakeMetadataClient{scheme: scheme}
+	cs := &FakeMetadataClient{scheme: scheme, tracker: o}
 	cs.AddReactor("*", "*", testing.ObjectReaction(o))
 	cs.AddWatchReactor("*", func(action testing.Action) (handled bool, ret watch.Interface, err error) {
 		gvr := action.GetResource()
@@ -80,7 +80,8 @@ func NewSimpleMetadataClient(scheme *runtime.Scheme, objects ...runtime.Object) 
 // you want to test easier.
 type FakeMetadataClient struct {
 	testing.Fake
-	scheme *runtime.Scheme
+	scheme  *runtime.Scheme
+	tracker testing.ObjectTracker
 }
 
 type metadataResourceClient struct {
@@ -89,7 +90,14 @@ type metadataResourceClient struct {
 	resource  schema.GroupVersionResource
 }
 
-var _ metadata.Interface = &FakeMetadataClient{}
+var (
+	_ metadata.Interface = &FakeMetadataClient{}
+	_ testing.FakeClient = &FakeMetadataClient{}
+)
+
+func (c *FakeMetadataClient) Tracker() testing.ObjectTracker {
+	return c.tracker
+}
 
 // Resource returns an interface for accessing the provided resource.
 func (c *FakeMetadataClient) Resource(resource schema.GroupVersionResource) metadata.Getter {
@@ -114,7 +122,8 @@ func (c *metadataResourceClient) CreateFake(obj *metav1.PartialObjectMetadata, o
 			Invokes(testing.NewRootCreateAction(c.resource, obj), obj)
 
 	case len(c.namespace) == 0 && len(subresources) > 0:
-		accessor, err := meta.Accessor(obj)
+		var accessor metav1.Object // avoid shadowing err
+		accessor, err = meta.Accessor(obj)
 		if err != nil {
 			return nil, err
 		}
@@ -127,7 +136,8 @@ func (c *metadataResourceClient) CreateFake(obj *metav1.PartialObjectMetadata, o
 			Invokes(testing.NewCreateAction(c.resource, c.namespace, obj), obj)
 
 	case len(c.namespace) > 0 && len(subresources) > 0:
-		accessor, err := meta.Accessor(obj)
+		var accessor metav1.Object // avoid shadowing err
+		accessor, err = meta.Accessor(obj)
 		if err != nil {
 			return nil, err
 		}

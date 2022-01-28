@@ -29,6 +29,7 @@ import (
 	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
 	printerstorage "k8s.io/kubernetes/pkg/printers/storage"
 	csrregistry "k8s.io/kubernetes/pkg/registry/certificates/certificates"
+	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 // REST implements a RESTStorage for CertificateSigningRequest.
@@ -43,10 +44,10 @@ func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, *Approva
 		NewListFunc:              func() runtime.Object { return &certificates.CertificateSigningRequestList{} },
 		DefaultQualifiedResource: certificates.Resource("certificatesigningrequests"),
 
-		CreateStrategy: csrregistry.Strategy,
-		UpdateStrategy: csrregistry.Strategy,
-		DeleteStrategy: csrregistry.Strategy,
-		ExportStrategy: csrregistry.Strategy,
+		CreateStrategy:      csrregistry.Strategy,
+		UpdateStrategy:      csrregistry.Strategy,
+		DeleteStrategy:      csrregistry.Strategy,
+		ResetFieldsStrategy: csrregistry.Strategy,
 
 		TableConvertor: printerstorage.TableConvertor{TableGenerator: printers.NewTableGenerator().With(printersinternal.AddHandlers)},
 	}
@@ -60,9 +61,12 @@ func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, *Approva
 	// dedicated strategies.
 	statusStore := *store
 	statusStore.UpdateStrategy = csrregistry.StatusStrategy
+	statusStore.ResetFieldsStrategy = csrregistry.StatusStrategy
+	statusStore.BeginUpdate = countCSRDurationMetric(csrDurationRequested, csrDurationHonored)
 
 	approvalStore := *store
 	approvalStore.UpdateStrategy = csrregistry.ApprovalStrategy
+	approvalStore.ResetFieldsStrategy = csrregistry.ApprovalStrategy
 
 	return &REST{store}, &StatusREST{store: &statusStore}, &ApprovalREST{store: &approvalStore}, nil
 }
@@ -97,6 +101,11 @@ func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.Updat
 	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
 }
 
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
+}
+
 var _ = rest.Patcher(&StatusREST{})
 
 // ApprovalREST implements the REST endpoint for changing the approval state of a CSR.
@@ -109,9 +118,21 @@ func (r *ApprovalREST) New() runtime.Object {
 	return &certificates.CertificateSigningRequest{}
 }
 
+// Get retrieves the object from the storage. It is required to support Patch.
+func (r *ApprovalREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+	return r.store.Get(ctx, name, options)
+}
+
 // Update alters the approval subset of an object.
 func (r *ApprovalREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
 	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
 	// subresources should never allow create on update.
 	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
 }
+
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *ApprovalREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
+}
+
+var _ = rest.Patcher(&ApprovalREST{})

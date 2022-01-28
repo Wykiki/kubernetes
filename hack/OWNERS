@@ -3,27 +3,20 @@
 reviewers:
   - bentheelder
   - cblecker
-  - eparis
   - fejta
-  - ixdy
-  - juanvallejo
   - hwdef
+  - justaugustus
   - lavalamp
   - SataQiu
   - spiffxp
   - sttts
-  - vishh
-  - xichengliudui
-  - zmerlynn
   - mikedanese
 approvers:
   - bentheelder
   - cblecker
   - deads2k
   - dims # for local-up-cluster related files
-  - eparis
   - fejta
-  - ixdy
   - lavalamp
   - liggitt
   - pwittrock
@@ -31,8 +24,10 @@ approvers:
   - soltysh # for sig-cli related stuff
   - spiffxp
   - sttts
-  - vishh
-  - zmerlynn
   - mikedanese
 emeritus_approvers:
+  - eparis
+  - ixdy
   - jbeda
+  - zmerlynn
+  - vishh

@@ -33,6 +33,7 @@ import (
 	appsv1client "k8s.io/client-go/kubernetes/typed/apps/v1"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/scheme"
+	"k8s.io/kubectl/pkg/util"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
 )
@@ -42,13 +43,16 @@ var (
 	Create a deployment with the specified name.`))
 
 	deploymentExample = templates.Examples(i18n.T(`
-	# Create a deployment named my-dep that runs the busybox image.
+	# Create a deployment named my-dep that runs the busybox image
 	kubectl create deployment my-dep --image=busybox
 
-	# Create a deployment with command
+	# Create a deployment with a command
 	kubectl create deployment my-dep --image=busybox -- date
 
-	# Create a deployment named my-dep that runs the busybox image and expose port 5701.
+	# Create a deployment named my-dep that runs the nginx image with 3 replicas
+	kubectl create deployment my-dep --image=nginx --replicas=3
+
+	# Create a deployment named my-dep that runs the busybox image and expose port 5701
 	kubectl create deployment my-dep --image=busybox --port=5701`))
 )
 
@@ -61,10 +65,12 @@ type CreateDeploymentOptions struct {
 	Name             string
 	Images           []string
 	Port             int32
+	Replicas         int32
 	Command          []string
 	Namespace        string
 	EnforceNamespace bool
 	FieldManager     string
+	CreateAnnotation bool
 
 	Client         appsv1client.AppsV1Interface
 	DryRunStrategy cmdutil.DryRunStrategy
@@ -73,9 +79,11 @@ type CreateDeploymentOptions struct {
 	genericclioptions.IOStreams
 }
 
-func NewCreateCreateDeploymentOptions(ioStreams genericclioptions.IOStreams) *CreateDeploymentOptions {
+// NewCreateDeploymentOptions returns an initialized CreateDeploymentOptions instance
+func NewCreateDeploymentOptions(ioStreams genericclioptions.IOStreams) *CreateDeploymentOptions {
 	return &CreateDeploymentOptions{
 		Port:       -1,
+		Replicas:   1,
 		PrintFlags: genericclioptions.NewPrintFlags("created").WithTypeSetter(scheme.Scheme),
 		IOStreams:  ioStreams,
 	}
@@ -84,12 +92,12 @@ func NewCreateCreateDeploymentOptions(ioStreams genericclioptions.IOStreams) *Cr
 // NewCmdCreateDeployment is a macro command to create a new deployment.
 // This command is better known to users as `kubectl create deployment`.
 func NewCmdCreateDeployment(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobra.Command {
-	o := NewCreateCreateDeploymentOptions(ioStreams)
+	o := NewCreateDeploymentOptions(ioStreams)
 	cmd := &cobra.Command{
 		Use:                   "deployment NAME --image=image -- [COMMAND] [args...]",
 		DisableFlagsInUseLine: true,
 		Aliases:               []string{"deploy"},
-		Short:                 deploymentLong,
+		Short:                 i18n.T("Create a deployment with the specified name"),
 		Long:                  deploymentLong,
 		Example:               deploymentExample,
 		Run: func(cmd *cobra.Command, args []string) {
@@ -103,10 +111,11 @@ func NewCmdCreateDeployment(f cmdutil.Factory, ioStreams genericclioptions.IOStr
 
 	cmdutil.AddApplyAnnotationFlags(cmd)
 	cmdutil.AddValidateFlags(cmd)
-	cmdutil.AddGeneratorFlags(cmd, "")
+	cmdutil.AddDryRunFlag(cmd)
 	cmd.Flags().StringSliceVar(&o.Images, "image", o.Images, "Image names to run.")
 	cmd.MarkFlagRequired("image")
 	cmd.Flags().Int32Var(&o.Port, "port", o.Port, "The port that this container exposes.")
+	cmd.Flags().Int32VarP(&o.Replicas, "replicas", "r", o.Replicas, "Number of replicas to create. Default is 1.")
 	cmdutil.AddFieldManagerFlagVar(cmd, &o.FieldManager, "kubectl-create")
 
 	return cmd
@@ -137,6 +146,8 @@ func (o *CreateDeploymentOptions) Complete(f cmdutil.Factory, cmd *cobra.Command
 		return err
 	}
 
+	o.CreateAnnotation = cmdutil.GetFlagBool(cmd, cmdutil.ApplyAnnotationsFlag)
+
 	o.DryRunStrategy, err = cmdutil.GetDryRunStrategy(cmd)
 	if err != nil {
 		return err
@@ -145,11 +156,7 @@ func (o *CreateDeploymentOptions) Complete(f cmdutil.Factory, cmd *cobra.Command
 	if err != nil {
 		return err
 	}
-	discoveryClient, err := f.ToDiscoveryClient()
-	if err != nil {
-		return err
-	}
-	o.DryRunVerifier = resource.NewDryRunVerifier(dynamicClient, discoveryClient)
+	o.DryRunVerifier = resource.NewDryRunVerifier(dynamicClient, f.OpenAPIGetter())
 	cmdutil.PrintFlagsWithDryRunStrategy(o.PrintFlags, o.DryRunStrategy)
 
 	printer, err := o.PrintFlags.ToPrinter()
@@ -163,6 +170,7 @@ func (o *CreateDeploymentOptions) Complete(f cmdutil.Factory, cmd *cobra.Command
 	return nil
 }
 
+// Validate makes sure there is no discrepency in provided option values
 func (o *CreateDeploymentOptions) Validate() error {
 	if len(o.Images) > 1 && len(o.Command) > 0 {
 		return fmt.Errorf("cannot specify multiple --image options and command")
@@ -173,6 +181,10 @@ func (o *CreateDeploymentOptions) Validate() error {
 // Run performs the execution of 'create deployment' sub command
 func (o *CreateDeploymentOptions) Run() error {
 	deploy := o.createDeployment()
+
+	if err := util.CreateOrUpdateAnnotation(o.CreateAnnotation, deploy, scheme.DefaultJSONEncoder()); err != nil {
+		return err
+	}
 
 	if o.DryRunStrategy != cmdutil.DryRunClient {
 		createOptions := metav1.CreateOptions{}
@@ -196,7 +208,6 @@ func (o *CreateDeploymentOptions) Run() error {
 }
 
 func (o *CreateDeploymentOptions) createDeployment() *appsv1.Deployment {
-	one := int32(1)
 	labels := map[string]string{"app": o.Name}
 	selector := metav1.LabelSelector{MatchLabels: labels}
 	namespace := ""
@@ -212,7 +223,7 @@ func (o *CreateDeploymentOptions) createDeployment() *appsv1.Deployment {
 			Namespace: namespace,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: &one,
+			Replicas: &o.Replicas,
 			Selector: &selector,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
